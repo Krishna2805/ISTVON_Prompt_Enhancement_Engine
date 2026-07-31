@@ -21,6 +21,7 @@ venv/
 logs/
 debug/
 rule_engine_logs.json
+istvon_transformations_log.json
 exports/*.json
 !exports/.gitkeep
 

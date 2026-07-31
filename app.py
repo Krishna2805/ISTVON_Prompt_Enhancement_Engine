@@ -15,6 +15,34 @@ from engine.completion_rules import ISTVONCompletionEngine
 from engine.llm_mapper import LLMISTVONMapper
 from engine.broker import ISTVONBroker, BrokerDecision
 from utils.helpers import HelperFunctions, ExamplePrompts
+from utils.json_logger import RuleEngineLogger
+
+# --- ISTVON Transformation Logger ---
+
+ISTVON_LOG_FILE = "istvon_transformations_log.json"
+
+def log_istvon_transformation(original_prompt: str, istvon_data: dict, 
+                               verdict: str, reason: str, processing_time_ms: int,
+                               llm_response: str = None):
+    """Append a complete ISTVON transformation record to the local log file."""
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "original_prompt": original_prompt,
+        "verdict": verdict,
+        "reason": reason,
+        "processing_time_ms": processing_time_ms,
+        "istvon_json": istvon_data,
+    }
+    if llm_response:
+        entry["llm_response"] = llm_response
+
+    try:
+        with open(ISTVON_LOG_FILE, "a", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception as e:
+        print(f"Warning: Could not write to ISTVON log: {e}")
+
 
 class ISTVONEngine:
     """Main ISTVON processing engine"""
@@ -42,7 +70,6 @@ class ISTVONEngine:
             if not broker_result["success"]:
                 # Content was blocked by broker
                 processing_time = int((time.time() - start_time) * 1000)
-                # Note: Rule engine decision is already logged to JSON file by broker
                 return {
                     "success": False,
                     "error": reason,
@@ -62,7 +89,6 @@ class ISTVONEngine:
                 block_reason = f"Blocked due to: {validation_result.get('reason', 'Cannot be sanitized')}"
                 
                 # Log the block decision to JSON file
-                from utils.json_logger import RuleEngineLogger
                 json_logger = RuleEngineLogger()
                 json_logger.log_decision(prompt, "BLOCK", block_reason)
                 
@@ -98,6 +124,11 @@ class ISTVONEngine:
                 prompt, validated_map, True, 
                 context.get('domain', 'auto'), processing_time, 
                 verdict, reason, sanitized_prompt
+            )
+            
+            # Step 9: Log to local ISTVON transformations file
+            log_istvon_transformation(
+                prompt, validated_map, verdict, reason, processing_time
             )
             
             return {
@@ -146,18 +177,56 @@ class ISTVONEngine:
         
         return mapping
     
-    def generate_response(self, prompt: str) -> str:
-        """Generate response using Gemini API"""
+    def generate_response_with_istvon(self, original_prompt: str, istvon_data: dict) -> str:
+        """Generate response using Gemini API with the full ISTVON spec as context."""
         try:
             import google.generativeai as genai
             from config import Config
+            
+            if not Config.GEMINI_API_KEY:
+                return "Error: No Gemini API key configured. Please add GEMINI_API_KEY to your .env file."
+            
+            # Build a rich prompt from the ISTVON spec
+            istvon_context_parts = []
+            
+            instructions = istvon_data.get("I", [])
+            if instructions:
+                istvon_context_parts.append("**Instructions:**\n" + "\n".join(f"- {i}" for i in instructions))
+            
+            sources = istvon_data.get("S", {})
+            if sources:
+                istvon_context_parts.append("**Sources & References:**\n" + json.dumps(sources, indent=2))
+            
+            tools = istvon_data.get("T", [])
+            if tools:
+                istvon_context_parts.append("**Tools to use:**\n" + "\n".join(f"- {t}" for t in tools))
+            
+            variables = istvon_data.get("V", {})
+            if variables:
+                istvon_context_parts.append("**Constraints & Variables:**\n" + json.dumps(variables, indent=2))
+            
+            outcome = istvon_data.get("O", {})
+            if outcome:
+                istvon_context_parts.append("**Expected Outcome:**\n" + json.dumps(outcome, indent=2))
+            
+            istvon_block = "\n\n".join(istvon_context_parts)
+            
+            full_prompt = (
+                f"PRIMARY USER REQUEST (Main Objective):\n"
+                f"\"{original_prompt}\"\n\n"
+                f"SUPPORTING ISTVON FRAMEWORK (Guidelines, Tools & Constraints):\n"
+                f"Use the structured ISTVON specification below to refine, format, and enhance your response. "
+                f"The primary user request above is your main objective; use the ISTVON specification to ensure completeness, correct formatting, and appropriate tooling.\n\n"
+                f"{istvon_block}\n\n"
+                f"Now produce a high-quality response that directly fulfills the primary request following all ISTVON guidelines."
+            )
             
             # Configure Gemini
             genai.configure(api_key=Config.GEMINI_API_KEY)
             model = genai.GenerativeModel(Config.DEFAULT_MODEL)
             
             # Generate response
-            response = model.generate_content(prompt)
+            response = model.generate_content(full_prompt)
             
             if response and response.text:
                 return response.text
@@ -166,111 +235,11 @@ class ISTVONEngine:
                 
         except Exception as e:
             return f"Error generating response: {str(e)}"
-    
-    def export_response_to_json(self, response_data: dict, filename: str = None) -> str:
-        """Export response data to JSON file and return the file path"""
-        try:
-            from datetime import datetime
-            import os
-            
-            # Create exports directory if it doesn't exist
-            exports_dir = "exports"
-            if not os.path.exists(exports_dir):
-                os.makedirs(exports_dir)
-            
-            # Generate filename if not provided
-            if not filename:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"response_export_{timestamp}.json"
-            
-            # Ensure filename has .json extension
-            if not filename.endswith('.json'):
-                filename += '.json'
-            
-            filepath = os.path.join(exports_dir, filename)
-            
-            # Write JSON data to file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(response_data, f, indent=2, ensure_ascii=False)
-            
-            return filepath
-            
-        except Exception as e:
-            print(f"Error exporting to JSON: {str(e)}")
-            return None
-    
-    def create_complete_response_data(self, original_prompt: str, istvon_data: dict, 
-                                    context: dict, response: str, processing_time: int,
-                                    verdict: str, reason: str, sanitized_prompt: str = None) -> dict:
-        """Create a complete response data structure for JSON export matching PostgreSQL schema"""
-        from datetime import datetime
-        
-        # Get the selected instruction from ISTVON as sanitized_prompt
-        selected_instruction = None
-        if istvon_data and 'I' in istvon_data and istvon_data['I']:
-            selected_instruction = istvon_data['I'][0] if isinstance(istvon_data['I'], list) else str(istvon_data['I'])
-        
-        return {
-            "id": None,  # Will be set by database auto-increment
-            "timestamp": datetime.now().isoformat(),
-            "original_prompt": original_prompt,
-            "verdict": verdict,
-            "reason": reason,
-            "sanitized_prompt": sanitized_prompt or selected_instruction,
-            "final_response": response,
-            "istvon_map_json": istvon_data,
-            "metadata": {
-                "processing_time_ms": processing_time,
-                "export_version": "2.0",
-                "context_analysis": context,
-                "database_logged": True
-            }
-        }
-    
-    def process_and_export_response(self, original_prompt: str, istvon_data: dict, 
-                                  context: dict, response: str, processing_time: int,
-                                  verdict: str, reason: str, sanitized_prompt: str = None) -> dict:
-        """Complete workflow: create response data, export to JSON, and log to database"""
-        try:
-            # Create complete response data
-            complete_response_data = self.create_complete_response_data(
-                original_prompt, istvon_data, context, response, 
-                processing_time, verdict, reason, sanitized_prompt
-            )
-            
-            # Export to JSON file
-            json_filepath = self.export_response_to_json(complete_response_data)
-            
-            # Log to database
-            self.db_manager.log_transformation(
-                original_prompt, istvon_data, True,
-                context.get('domain', 'auto'), processing_time,
-                verdict, reason, sanitized_prompt, response
-            )
-            
-            return {
-                "success": True,
-                "json_filepath": json_filepath,
-                "response_data": complete_response_data,
-                "database_logged": True
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "json_filepath": None,
-                "database_logged": False
-            }
-    
-    def import_json_to_database(self, json_filepath: str) -> bool:
-        """Import a JSON file back into the database"""
-        return self.db_manager.import_from_json_file(json_filepath)
+
 
 def setup_environment():
     """Setup environment with error handling"""
     try:
-        # Test imports
         from database import DatabaseManager
         from config import Config
         from engine.istvon_schema import ISTVONSchema
@@ -308,7 +277,7 @@ def main():
     # Initialize the engine
     engine = ISTVONEngine()
     
-    # Sidebar with examples and analytics
+    # --- Sidebar (cleaned up) ---
     with st.sidebar:
         st.header("📚 Example Prompts")
         
@@ -321,83 +290,11 @@ def main():
             example_prompt = ExamplePrompts.get_example(example_type)
             st.text_area("Example:", value=example_prompt, height=100, disabled=True)
         
-        st.header("📊 Analytics")
-        try:
-            analytics = engine.db_manager.get_analytics()
-            st.metric("Total Transformations", analytics.get('total_transformations', 0))
-            st.metric("Success Rate", f"{analytics.get('success_rate', 0):.1f}%")
-            st.metric("Avg Prompt Length", f"{analytics.get('avg_prompt_length', 0):.0f} chars")
-        except Exception as e:
-            # Database might not be connected - this is expected in many cases
-            st.info("No analytics data yet")
-        
-        st.header("🔧 Recent Sanitized Prompts")
-        try:
-            sanitized_prompts = engine.db_manager.get_sanitized_prompts(5)
-            if sanitized_prompts:
-                for i, prompt_data in enumerate(sanitized_prompts, 1):
-                    with st.expander(f"Prompt {i} - {prompt_data['verdict']}"):
-                        st.write("**Original:**", prompt_data['original_prompt'][:100] + "...")
-                        st.write("**Sanitized:**", prompt_data['sanitized_prompt'][:100] + "...")
-                        st.write("**Time:**", prompt_data['timestamp'])
-            else:
-                st.info("No sanitized prompts yet")
-        except Exception as e:
-            # Database might not be connected - this is expected in many cases
-            st.info("No sanitized prompts data yet")
-        
-        st.header("📁 JSON Import/Export")
-        st.write("Import JSON files back into database:")
-        
-        # File uploader for JSON import
-        uploaded_file = st.file_uploader(
-            "Choose a JSON file to import",
-            type=['json'],
-            key="json_importer"
-        )
-        
-        if uploaded_file is not None:
-            try:
-                # Save uploaded file temporarily
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_filepath = tmp_file.name
-                
-                # Import to database
-                if engine.import_json_to_database(tmp_filepath):
-                    st.success("✅ JSON file imported successfully to database!")
-                else:
-                    st.error("❌ Failed to import JSON file to database")
-                
-                # Clean up temp file
-                import os
-                os.unlink(tmp_filepath)
-                
-            except Exception as e:
-                st.error(f"❌ Error importing file: {str(e)}")
-        
-        # Show recent exports
-        st.write("**Recent Exports:**")
-        try:
-            import os
-            exports_dir = "exports"
-            if os.path.exists(exports_dir):
-                export_files = [f for f in os.listdir(exports_dir) if f.endswith('.json')]
-                if export_files:
-                    # Sort by modification time (newest first)
-                    export_files.sort(key=lambda x: os.path.getmtime(os.path.join(exports_dir, x)), reverse=True)
-                    for i, filename in enumerate(export_files[:3], 1):
-                        st.write(f"{i}. `{filename}`")
-                else:
-                    st.info("No export files yet")
-            else:
-                st.info("No exports directory yet")
-        except Exception as e:
-            # File system issues - this is expected if exports directory doesn't exist
-            st.info("No export files available")
+        st.markdown("---")
+        st.header("ℹ️ System Status")
+        st.metric("API Status", "✅ Configured" if Config.is_api_configured() else "⚠️ Rule-based fallback")
     
-    # Main input area
+    # --- Main input area ---
     st.subheader("📝 Enter Your Prompt")
     
     # Text area for prompt input
@@ -422,6 +319,9 @@ def main():
         clear_btn = st.button("🗑️ Clear")
     
     if clear_btn:
+        # Clear session state explicitly before rerun
+        for key in ['istvon_result', 'original_prompt', 'generated_response']:
+            st.session_state.pop(key, None)
         st.rerun()
     
     # Process the prompt
@@ -431,19 +331,11 @@ def main():
                 result = engine.process_prompt(prompt)
                 
                 if result["success"]:
-                    # Store result in session state to avoid re-processing
+                    # Store result in session state
                     st.session_state['istvon_result'] = result
                     st.session_state['original_prompt'] = prompt
-                    st.success("✅ Prompt processed successfully!")
-                    
-                    # Display verdict and reason
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.info(f"**Verdict:** {result.get('verdict', 'N/A')}")
-                    with col2:
-                        st.info(f"**Reason:** {result.get('reason', 'N/A')}")
-                    
-                    # Just show success message - detailed results will be shown in session state section below
+                    # Clear any previous response when a new prompt is processed
+                    st.session_state.pop('generated_response', None)
                 
                 else:
                     if result.get("blocked", False):
@@ -469,7 +361,7 @@ def main():
         else:
             st.warning("Please enter a prompt first.")
     
-    # Display ISTVON result from session state (if exists)
+    # --- Display ISTVON result from session state ---
     if 'istvon_result' in st.session_state:
         result = st.session_state['istvon_result']
         
@@ -477,110 +369,90 @@ def main():
         st.success("✅ ISTVON Framework Generated Successfully!")
         
         # Display verdict and reason
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.info(f"**Verdict:** {result.get('verdict', 'N/A')}")
         with col2:
             st.info(f"**Reason:** {result.get('reason', 'N/A')}")
+        with col3:
+            st.info(f"**Processing Time:** {result['processing_time']} ms")
         
-        # Display results in tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["🎯 ISTVON JSON", "📊 Context Analysis", "🔧 Generate Response", "⏱️ Processing Info"])
+        # --- Tab 1: ISTVON JSON ---
+        tab1, tab2 = st.tabs(["🎯 ISTVON Framework", "⏱️ Processing Info"])
         
         with tab1:
             st.subheader("Generated ISTVON JSON")
             st.json(result["istvon"])
             
-            # Download button
+            # Download ISTVON-only JSON
             json_str = json.dumps(result["istvon"], indent=2)
             st.download_button(
-                label="📥 Download JSON",
+                label="📥 Download ISTVON JSON",
                 data=json_str,
                 file_name=f"istvon_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
+                mime="application/json",
+                key="download_istvon_only"
             )
         
         with tab2:
-            st.subheader("Context Analysis")
-            context = result["context"]
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Domain", context.get('domain', 'general'))
-            with col2:
-                st.metric("Complexity", context.get('complexity', 'medium'))
-            with col3:
-                st.metric("Specificity", context.get('specificity', 'medium'))
-            
-            if context.get('domain_specific_rules'):
-                st.subheader("Domain Rules Applied")
-                st.json(context['domain_specific_rules'])
-        
-        with tab3:
-            st.subheader("🚀 Generate Response")
-            
-            # Get instructions from ISTVON "I" section
-            istvon_instructions = result["istvon"].get("I", [])
-            
-            if istvon_instructions:
-                st.write("**Select a prompt from ISTVON Instructions:**")
-                
-                # Create dropdown with ISTVON instructions
-                selected_instruction = st.selectbox(
-                    "Choose an instruction prompt:",
-                    istvon_instructions,
-                    key="instruction_selector"
-                )
-                
-                # Generate response button
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    generate_response_btn = st.button("🚀 Generate Response", type="primary", key="generate_response_from_istvon")
-                
-                # Generate response if button clicked
-                if generate_response_btn and selected_instruction:
-                    with st.spinner("Generating response..."):
-                        response = engine.generate_response(selected_instruction)
-                        
-                        # Process and export response (JSON + Database)
-                        export_result = engine.process_and_export_response(
-                            original_prompt=st.session_state.get('original_prompt', ''),
-                            istvon_data=result["istvon"],
-                            context=result["context"],
-                            response=response,
-                            processing_time=result.get('processing_time', 0),
-                            verdict=result.get('verdict', 'ALLOW'),
-                            reason=result.get('reason', 'ISTVON instruction'),
-                            sanitized_prompt=result.get('sanitized_prompt')
-                        )
-                        
-                        st.success("✅ Response generated successfully!")
-                        st.text_area("Generated Response:", value=response, height=200, key="response_output")
-                        
-                        # Show export results
-                        if export_result["success"]:
-                            st.success(f"📄 Response exported to JSON: `{export_result['json_filepath']}`")
-                            st.info("💾 Data has been logged to the database")
-                        else:
-                            st.error(f"❌ Export failed: {export_result.get('error', 'Unknown error')}")
-                            st.warning("⚠️ Response was generated but export failed")
-            else:
-                st.warning("No instructions found in ISTVON framework.")
-        
-        with tab4:
             st.subheader("Processing Information")
             st.metric("Processing Time", f"{result['processing_time']} ms")
             st.metric("API Status", "✅ Configured" if Config.is_api_configured() else "⚠️ Using fallback")
+        
+        # --- Response Generation Section (below tabs) ---
+        st.markdown("---")
+        st.subheader("🚀 Response Generation")
+        st.markdown(
+            "Would you like to send the **ISTVON JSON** and your **original prompt** "
+            "to the LLM for response generation?"
+        )
+        
+        generate_btn = st.button("✅ Yes, Generate Response", type="primary", key="generate_response_btn")
+        
+        if generate_btn:
+            if not Config.is_api_configured():
+                st.error("❌ No Gemini API key configured. Add `GEMINI_API_KEY` to your `.env` file to use response generation.")
+            else:
+                with st.spinner("Generating response from LLM using ISTVON spec..."):
+                    original_prompt = st.session_state.get('original_prompt', '')
+                    response_text = engine.generate_response_with_istvon(
+                        original_prompt, result["istvon"]
+                    )
+                    st.session_state['generated_response'] = response_text
+                    
+                    # Log the response alongside the ISTVON spec
+                    log_istvon_transformation(
+                        original_prompt, result["istvon"],
+                        result.get('verdict', 'ALLOW'),
+                        result.get('reason', 'Response generated'),
+                        result.get('processing_time', 0),
+                        llm_response=response_text
+                    )
+        
+        # Display generated response (persisted in session state)
+        if 'generated_response' in st.session_state:
+            st.markdown("---")
+            st.subheader("📝 Generated Response")
+            st.markdown(st.session_state['generated_response'])
             
-            # Show recent transformations
-            st.subheader("Recent Transformations")
-            try:
-                recent = engine.db_manager.get_recent_transformations(3)
-                for item in recent:
-                    status_icon = "✅" if item['success'] else "❌"
-                    st.text(f"{status_icon} {item['prompt']} ({item['timestamp']})")
-            except Exception as e:
-                # Database might not be connected - this is expected in many cases
-                st.info("No recent transformations")
+            # Download ISTVON + Response combined JSON
+            combined_data = {
+                "timestamp": datetime.now().isoformat(),
+                "original_prompt": st.session_state.get('original_prompt', ''),
+                "istvon_json": result["istvon"],
+                "llm_response": st.session_state['generated_response'],
+                "verdict": result.get('verdict', 'N/A'),
+                "reason": result.get('reason', 'N/A'),
+                "processing_time_ms": result.get('processing_time', 0)
+            }
+            combined_json_str = json.dumps(combined_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="📥 Download ISTVON + Response JSON",
+                data=combined_json_str,
+                file_name=f"istvon_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                key="download_istvon_response"
+            )
     
     # Footer
     st.markdown("---")

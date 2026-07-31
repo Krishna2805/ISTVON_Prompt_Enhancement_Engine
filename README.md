@@ -51,7 +51,12 @@ User Natural Language Prompt
  └──────────┬───────────┘
             │
             ▼
-  Structured ISTVON JSON
+   Structured ISTVON JSON
+            │
+            ▼
+ ┌──────────────────────┐
+ │ Response Generation  │ (Optional: Sends Prompt + ISTVON I-S-T-V-O spec to LLM)
+ └──────────────────────┘
 ```
 
 ### Safety Broker Decisions
@@ -67,8 +72,9 @@ Evaluates prompt quality against key dimensions: **C**ontext, **O**bjective, **S
 ## 📋 Prerequisites & Things to Know Before Running
 
 - **Python Version**: Python 3.9+ installed on your system.
-- **No Mandatory API Keys**: The app runs 100% out of the box using built-in rule-based pattern matchers. Providing a `GEMINI_API_KEY` enables Google Gemini LLM enhancements, but is entirely optional.
-- **No Mandatory Database**: PostgreSQL integration is optional for enterprise telemetry logging. If PostgreSQL is not configured, the system seamlessly uses local JSON logging (`rule_engine_logs.json`).
+- **No Mandatory API Keys**: The app runs 100% out of the box using built-in rule-based pattern matchers. Providing a `GEMINI_API_KEY` enables Google Gemini LLM enhancements and response generation, but is entirely optional.
+- **No Mandatory Database**: PostgreSQL integration is optional for enterprise telemetry logging. If PostgreSQL is not configured, the system seamlessly logs transformations locally to JSON (`istvon_transformations_log.json` & `rule_engine_logs.json`).
+- **Flexible JSON Exports**: Download standalone ISTVON framework specifications or combined ISTVON + LLM generated response payloads.
 
 ---
 
