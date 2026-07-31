@@ -1,0 +1,36 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.sqlite3
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment Variables
+.env
+.env.*
+
+# Logs, Telemetry & Generated Exports
+*.log
+logs/
+debug/
+rule_engine_logs.json
+exports/*.json
+!exports/.gitkeep
+
+# Testing cache
+.pytest_cache/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Supplementary Documentation (Keep only README.md for GitHub)
+PROJECT_REPORT.md
