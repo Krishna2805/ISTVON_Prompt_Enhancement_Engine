@@ -64,20 +64,30 @@ Evaluates prompt quality against key dimensions: **C**ontext, **O**bjective, **S
 
 ---
 
+## 📋 Prerequisites & Things to Know Before Running
+
+- **Python Version**: Python 3.9+ installed on your system.
+- **No Mandatory API Keys**: The app runs 100% out of the box using built-in rule-based pattern matchers. Providing a `GEMINI_API_KEY` enables Google Gemini LLM enhancements, but is entirely optional.
+- **No Mandatory Database**: PostgreSQL integration is optional for enterprise telemetry logging. If PostgreSQL is not configured, the system seamlessly uses local JSON logging (`rule_engine_logs.json`).
+
+---
+
 ## ⚙️ Installation & Setup
 
 ### 1. Clone & Setup Environment
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/Krishna2805/ISTVON_Prompt_Enhancement_Engine.git
 cd ISTVON_Prompt_Enhancement_Engine
 
 # Create virtual environment
 python -m venv venv
 
 # Activate virtual environment
-# Windows:
-venv\Scripts\activate
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# Windows (Command Prompt):
+venv\Scripts\activate.bat
 # Linux/macOS:
 source venv/bin/activate
 
@@ -85,20 +95,20 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configuration (`.env`)
+### 2. Configuration (`.env` - Optional)
 
-Copy `.env.example` to `.env` (optional):
+Copy `.env.example` to `.env` if you wish to configure optional credentials:
 
 ```bash
 cp .env.example .env
 ```
 
-Environment options:
+Environment settings template:
 ```env
-# Google Gemini API Key (Optional: system automatically falls back to rule-based mapping if omitted)
+# Optional: Google Gemini API Key for LLM-powered prompt transformation
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# PostgreSQL Database Configuration (Optional: for persistent telemetry logging)
+# Optional: PostgreSQL Database connection for telemetry
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_DB=istvon_db
@@ -106,20 +116,25 @@ POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your_password
 ```
 
-*Note: The engine is fully functional out of the box without any API keys or database connections.*
-
 ---
 
 ## 🚀 Usage & Deployment
 
-### 1. Launch the Streamlit Web Application
+### 1. Launch the Web Dashboard (Streamlit)
 
 ```bash
 streamlit run app.py
 ```
-Open your browser at `http://localhost:8501`.
+- Default URL: **`http://localhost:8501`**
+- Custom Port (if 8501 is in use): `streamlit run app.py --server.port 8502`
 
-### 2. Run Test Suite
+### 2. Run Standalone CLI Demo
+
+```bash
+python demo.py
+```
+
+### 3. Run Test Suite
 
 ```bash
 # Run all unit tests
@@ -133,11 +148,23 @@ python -m pytest tests/test_rules.py -v
 
 ---
 
+## 🛠️ Helpful Tips & Troubleshooting
+
+| Scenario | Detail / Solution |
+|----------|-------------------|
+| **Default Web Port** | `http://localhost:8501` |
+| **Port Already in Use** | Run `streamlit run app.py --server.port 8502` |
+| **Running Without API Key** | App automatically uses rule-based pattern matching (no API key needed) |
+| **Running Without Database** | App logs decisions locally to JSON (no database setup required) |
+| **Execution Policy Error (Windows)** | Run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process` before activating venv |
+
+---
+
 ## 📂 Project Structure
 
 ```
 ISTVON_Prompt_Enhancement_Engine/
-├── README.md                  # Comprehensive documentation
+├── README.md                  # Comprehensive project documentation
 ├── app.py                     # Main Streamlit web application
 ├── config.py                  # Environment & schema configuration
 ├── database.py                # PostgreSQL telemetry & audit logger
