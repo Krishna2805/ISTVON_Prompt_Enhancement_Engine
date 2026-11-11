@@ -1,0 +1,7 @@
+streamlit==1.28.0
+numpy<2,>=1.19.3
+pyarrow>=6.0,<26
+google-genai>=1.0.0
+python-dotenv==1.0.0
+psycopg2-binary>=2.9.0
+pytest>=8.0.0

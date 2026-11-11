@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.sqlite3
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+
+# Logs, Telemetry & Generated Exports
+*.log
+logs/
+debug/
+rule_engine_logs.json
+istvon_transformations_log.json
+exports/*.json
+!exports/.gitkeep
+
+# Testing cache
+.pytest_cache/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Internal Engineering Backlog & Task Tracking
+ENGINEERING_BACKLOG.md
+.agent/
