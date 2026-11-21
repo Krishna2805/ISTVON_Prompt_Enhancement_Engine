@@ -1,0 +1,10 @@
+# Local-only by default. Without this, Streamlit listens on every network interface, and
+# Streamlit 1.28 has published advisories that need network access to the server
+# (CVE-2024-42474, CVE-2026-33682 on Windows; GHSA-8qw9-gf7w-42x5).
+# To share on your LAN on purpose: streamlit run app.py --server.address 0.0.0.0
+[server]
+address = "localhost"
+
+[browser]
+# Don't send Streamlit usage statistics
+gatherUsageStats = false

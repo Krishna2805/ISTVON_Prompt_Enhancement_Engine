@@ -1,5 +1,6 @@
 # engine/llm_mapper.py
 import json
+import re
 import urllib.request
 from typing import Dict, Any, Optional
 from config import Config
@@ -108,7 +109,8 @@ class LLMISTVONMapper:
     @staticmethod
     def _fence_user_prompt(prompt: str) -> str:
         """Delimit untrusted user prompt text and escape closing fence tags."""
-        escaped = prompt.replace("</user_prompt>", "<\\/user_prompt>")
+        # any spelling of a closing tag ("</USER_PROMPT>", "</ user_prompt >") must not end the fence
+        escaped = re.sub(r"<\s*/\s*user_prompt\s*>", "<\\\\/user_prompt>", prompt, flags=re.IGNORECASE)
         return f"<user_prompt>\n{escaped}\n</user_prompt>"
 
     def _build_enhancement_prompt(self, prompt: str, preliminary_map: Dict, context: Dict) -> str:

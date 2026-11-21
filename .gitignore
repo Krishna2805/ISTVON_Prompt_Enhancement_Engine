@@ -14,6 +14,9 @@ venv/
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
 
 
 # Logs, Telemetry & Generated Exports
@@ -22,8 +25,7 @@ logs/
 debug/
 rule_engine_logs.json
 istvon_transformations_log.json
-exports/*.json
-!exports/.gitkeep
+exports/
 
 # Testing cache
 .pytest_cache/
@@ -38,3 +40,6 @@ Thumbs.db
 # Internal Engineering Backlog & Task Tracking
 ENGINEERING_BACKLOG.md
 .agent/
+
+# Personal interview notes (not for the repo)
+PERSONAL_NOTES.md
