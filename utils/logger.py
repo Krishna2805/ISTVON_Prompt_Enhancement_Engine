@@ -133,20 +133,20 @@ class Logger:
         self.info("Performance Metrics", metrics)
     
     def log_user_action(self, action: str, user_data: dict):
-        """Log user actions (sanitized)"""
-        sanitized_data = self._sanitize_user_data(user_data)
-        self.info(f"User Action: {action}", sanitized_data)
-    
-    def _sanitize_user_data(self, data: dict) -> dict:
-        """Sanitize user data for logging"""
-        sanitized = {}
+        """Log a user action with allowlisted metadata only (no prompt text)"""
+        metadata = self._metadata_only(user_data)
+        self.info(f"User Action: {action}", metadata)
+
+    def _metadata_only(self, data: dict) -> dict:
+        """Keep only the allowlisted metadata keys; everything else is dropped"""
+        metadata = {}
         safe_keys = ["prompt_length", "domain", "complexity", "processing_time"]
-        
+
         for key, value in data.items():
             if key in safe_keys:
-                sanitized[key] = value
-        
-        return sanitized
+                metadata[key] = value
+
+        return metadata
 
 # Global logger instances
 app_logger = Logger("ISTVONApp")

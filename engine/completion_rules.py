@@ -101,11 +101,10 @@ class ISTVONCompletionEngine:
             "academic": ["Academic rigor", "Proper citations and references"]
         }
         
-        if domain in domain_criteria:
-            enhanced["success_criteria"].extend(domain_criteria[domain])
-        
-        # Ensure uniqueness
-        enhanced["success_criteria"] = list(set(enhanced["success_criteria"]))
+        # Append domain criteria, de-duplicated in insertion order (set() reordered them per run)
+        enhanced["success_criteria"] = list(dict.fromkeys(
+            enhanced["success_criteria"] + domain_criteria.get(domain, [])
+        ))
         
         return enhanced
     
@@ -119,8 +118,7 @@ class ISTVONCompletionEngine:
         
         # Enhance existing tools with domain defaults
         elif result.get("T") and domain_rules.get("default_tools"):
-            result["T"].extend(domain_rules["default_tools"])
-            result["T"] = list(set(result["T"]))  # Remove duplicates
+            result["T"] = list(dict.fromkeys(result["T"] + domain_rules["default_tools"]))
         
         return result
     

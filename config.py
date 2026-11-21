@@ -26,9 +26,12 @@ except ImportError:
 class Config:
     """Configuration settings for the ISTVON Prompt Enhancement Engine"""
     
-    # API Configuration
+    # API Configuration (Gemini or Groq; LLM_PROVIDER picks one when both are set, default: Gemini first)
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')  # Returns None if not set
     DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '')
+    GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+    GROQ_MODEL = os.getenv('GROQ_MODEL', '')
+    LLM_PROVIDER = os.getenv('LLM_PROVIDER', '').strip().lower()
     
     # ISTVON Schema Definition
     ISTVON_SCHEMA = {
@@ -146,8 +149,36 @@ class Config:
         return not cls._is_placeholder(model_name)
     
     @classmethod
-    def is_api_configured(cls) -> bool:
-        """Check if API is properly configured (alias for is_valid_api_key)"""
-        return cls.is_valid_api_key()
+    def llm_settings(cls):
+        """(provider, api_key, model) of the first usable LLM provider, or (None, None, None)."""
+        candidates = {
+            "gemini": (cls.GEMINI_API_KEY, cls.DEFAULT_MODEL),
+            "groq": (cls.GROQ_API_KEY, cls.GROQ_MODEL),
+        }
+        order = [cls.LLM_PROVIDER] if cls.LLM_PROVIDER in candidates else ["gemini", "groq"]
+        for name in order:
+            key, model = candidates[name]
+            if cls.is_valid_api_key(key or "") and cls.is_valid_model_name(model or ""):
+                return name, key, model
+        return None, None, None
+
+    @classmethod
+    def llm_setup_hint(cls) -> str:
+        """Plain-language reason no LLM is active, and how to enable one (shown in the UI)."""
+        def missing(key, model, key_var, model_var):
+            return [var for ok, var in ((cls.is_valid_api_key(key or ""), key_var),
+                                        (cls.is_valid_model_name(model or ""), model_var)) if not ok]
+        gemini = missing(cls.GEMINI_API_KEY, cls.DEFAULT_MODEL, "GEMINI_API_KEY", "GEMINI_MODEL")
+        groq = missing(cls.GROQ_API_KEY, cls.GROQ_MODEL, "GROQ_API_KEY", "GROQ_MODEL")
+        how = ("To enable an LLM, set GEMINI_API_KEY + GEMINI_MODEL or GROQ_API_KEY + GROQ_MODEL "
+               "in .env (see .env.example) and restart the app.")
+        if cls.LLM_PROVIDER in ("gemini", "groq"):
+            gaps = gemini if cls.LLM_PROVIDER == "gemini" else groq
+            if gaps:
+                return (f"LLM_PROVIDER={cls.LLM_PROVIDER} forces that provider, but it is missing "
+                        f"(not set or a placeholder): {', '.join(gaps)}. {how}")
+        elif gemini and groq:
+            return f"No LLM configured (not set or a placeholder: {', '.join(gemini + groq)}). {how}"
+        return "An LLM is configured but its client failed to start; see the server console."
 
 

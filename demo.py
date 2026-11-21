@@ -19,7 +19,7 @@ def main():
             response="I am fine, thank you.",
         )
         if logged:
-            print("✅ Sample row inserted into PostgreSQL prompt_log successfully.")
+            print("[OK] Sample row inserted into PostgreSQL prompt_log successfully.")
         else:
             print("PostgreSQL demo note: Database unavailable or unconfigured; skipped insertion.")
     finally:

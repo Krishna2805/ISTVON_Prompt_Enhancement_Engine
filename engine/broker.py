@@ -1,88 +1,104 @@
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from enum import Enum
 import re
-import json
 
 from utils.json_logger import RuleEngineLogger
-from .pattern_matchers import ISTVONPatternMatcher
 from .context_analyzers import ContextAnalyzer
-from .llm_mapper import LLMISTVONMapper
-from .completion_rules import ISTVONCompletionEngine
-from .istvon_schema import ISTVONSchema
+
+# Safety rule levels. A prompt's verdict is set by its single worst match (no summing):
+# one BLOCK-level match blocks; otherwise one REVIEW-level match gives NEEDS_FIX, which
+# still proceeds but shows a warning. Summing scores let two harmless topic words
+# ("bank", "financial") add up to a block.
+BLOCK_LEVEL = 5
+REVIEW_LEVEL = 2
+
+_ACTION = r"(?:write|writing|create|creating|build|building|make|making|develop|developing|code|coding|craft|crafting|design|designing|generate|generating|draft|drafting|deploy|deploying|spread|spreading|send|sending)"
+# Person targets. "'s" is excluded so "hurt someone's feelings" is not a threat;
+# "child" excludes software senses ("kill a child process").
+_PERSON = (r"(?:someone|somebody|people|(?:a|the)\s+person|him|her|them|"
+           r"(?:my|his|her|their|your|a|the)\s+(?:wife|husband|partner|girlfriend|boyfriend|ex|boss|co-?workers?|"
+           r"neighbou?rs?|teachers?|friends?|mom|mother|dad|father|brother|sister|son|daughter|"
+           r"child(?!\s+(?:process|thread|node|element|component|task|widget))|kids?|family|roommates?|classmates?))\b(?!'s)")
+_SYSTEM = r"(?:systems?|servers?|networks?|websites?|sites?|computers?|accounts?|databases?|infrastructure|phones?|wi-?fi|cameras?|emails?)"
+_ATTACK_TARGET = r"(?:systems?|servers?|networks?|websites?|computers?|databases?|infrastructure)"
+_DET = r"(?:a|an|the|their|his|her|someone's|my|our)"
+_DRUGS = r"(?:meth|methamphetamine|cocaine|crack\s+cocaine|heroin|fentanyl|lsd|mdma|dmt|ghb|ketamine)"
+_MINOR = r"(?:child|children|minors?|underage|kids?|preteens?)"
+_SEXUAL = r"(?:porn\w*|nude|naked|erotic|sexually\s+explicit)"
+
+# (category, level, pattern). Intent phrases block; bare topic words only flag for review.
+SAFETY_RULES = [
+    # dangerous: weapons, violence, drugs
+    ("dangerous", BLOCK_LEVEL, r"\b(?:make|making|build|building|create|creating|assemble|assembling)\s+(?:an?\s+)?(?:\w+\s+){0,2}(?:explosives|explosive\s+(?:devices?|vests?|charges?)|bombs?|weapons?)\b"),
+    ("dangerous", BLOCK_LEVEL, rf"\b(?:kill|murder|poison|stab|shoot|attack|harm|hurt|beat\s+up)(?:s|ed|ing)?\s+{_PERSON}"),
+    ("dangerous", BLOCK_LEVEL, r"\bunalive\b"),
+    ("dangerous", BLOCK_LEVEL, rf"\b(?:make|making|cook|cooking|synthesi[sz]e|synthesi[sz]ing|manufactur(?:e|ing)|produce|producing)\s+(?:\w+\s+){{0,2}}{_DRUGS}\b"),
+    ("dangerous", BLOCK_LEVEL, rf"\b(?:recipe|instructions|steps|guide)\s+(?:for|to\s+make)\s+(?:\w+\s+)?{_DRUGS}\b|\b{_DRUGS}\s+recipe\b"),
+    ("dangerous", BLOCK_LEVEL, r"\b(?:drug\s+manufactur(?:e|ing)|poison\s+recipe)\b"),
+    ("dangerous", REVIEW_LEVEL, r"\b(?:explosives|bombs?|illegal)\b"),
+    # self-harm
+    ("self_harm", BLOCK_LEVEL, r"\b(?:commit(?:ting)?\s+suicide|(?:kill|hang|cut|harm|hurt|starve|poison|drown)(?:ing)?\s+myself|slit(?:ting)?\s+my\s+wrists?|(?:end|take)(?:ing)?\s+my\s+(?:own\s+)?life)\b"),
+    ("self_harm", REVIEW_LEVEL, r"\b(?:suicid\w*|self[- ]harm)\b"),
+    # malicious: offensive cyber
+    ("malicious", BLOCK_LEVEL, rf"\bhack(?:s|ed|ing)?\s+(?:into\b|{_PERSON}|(?:{_DET}\s+)?(?:\w+\s+)?{_SYSTEM}\b)"),
+    ("malicious", BLOCK_LEVEL, rf"\b(?:attack|ddos|breach|compromis)(?:e|es|s|ed|ing)?\s+(?:{_DET}\s+)?(?:\w+\s+)?{_ATTACK_TARGET}\b"),
+    ("malicious", BLOCK_LEVEL, rf"\b{_ACTION}\s+(?:(?:a|an|some|the)\s+)?(?:\w+\s+){{0,2}}(?:malware|ransomware|keyloggers?|spyware|rootkits?|trojans?|botnets?|backdoors?|computer\s+virus(?:es)?|phishing)\b"),
+    ("malicious", BLOCK_LEVEL, r"\b(?:write|writing|code|coding|program|programming|develop|developing|deploy|deploying)\s+(?:(?:a|an|some|the)\s+)?(?:\w+\s+){0,2}virus(?:es)?\b"),
+    ("malicious", BLOCK_LEVEL, r"\bmalicious\s+(?:code|software|scripts?|payloads?|programs?)\b"),
+    ("malicious", BLOCK_LEVEL, r"\b(?:steal|steals|stealing|stole|stolen)\s+(?:\S+\s+){0,2}(?:data|passwords?|credentials?|identit(?:y|ies)|money|credit\s+cards?|accounts?|(?:browser|session|auth|http)\s+cookies|tokens?|information|info)\b"),
+    ("malicious", BLOCK_LEVEL, r"\b(?:bypass(?:es|ed|ing)?|crack(?:s|ed|ing)?|brute[\s-]*forc(?:e|es|ed|ing))\s+(?:\S+\s+){0,2}(?:passwords?|logins?|authentication|2fa|mfa|accounts?)\b"),
+    ("malicious", REVIEW_LEVEL, r"\b(?:hack(?:s|ed|ing|er|ers)?|malware|ransomware|keyloggers?|spyware|rootkits?|trojans?|botnets?|phish(?:ing)?|zero[- ]day|exploit\s+(?:code|kits?)|(?:sql|code|command|prompt)\s+injection|data\s+(?:breach|theft)|identity\s+theft|credential\s+harvest(?:ing)?|unauthori[sz]ed\s+access|exfiltrat\w*)\b"),
+    # inappropriate
+    ("inappropriate", BLOCK_LEVEL, rf"\b{_MINOR}\b(?:\W+\w+){{0,3}}?\W+{_SEXUAL}\b(?!\s+eye)|\b{_SEXUAL}\b(?!\s+eye)(?:\W+\w+){{0,3}}?\W+{_MINOR}\b"),
+    # the generated thing must BE the content: "write racist jokes", not "write an essay on hate speech"
+    ("inappropriate", BLOCK_LEVEL, rf"\b{_ACTION}\s+(?:(?:a|an|some|more)\s+)?(?:(?!on\b|about\b|regarding\b|against\b)\w+\s+)?(?:hate\s+speech|racist\s+(?:jokes?|content|propaganda)|porn(?:ography|ographic)?|sexually\s+explicit)"),
+    ("inappropriate", REVIEW_LEVEL, r"\b(?:explicit\s+content|pornographic|porn|hate\s+speech|racist|harassment|bully(?:ing|ied)?)\b"),
+    # sensitive: personal data, not topic words like "bank" or "medical"
+    ("sensitive", REVIEW_LEVEL, r"\b(?:personal\s+(?:data|information|info|details|financial|medical|health)|private\s+information|confidential|credit\s+card\s+(?:numbers?|details|info)|bank\s+(?:account|login|credentials|details)|ssn|social\s+security\s+number|(?:health|medical)\s+records|patient\s+data)\b"),
+    ("sensitive", REVIEW_LEVEL, r"\b\d{3}-\d{2}-\d{4}\b|\b(?:\d[ -]?){12,15}\d\b"),  # SSN / card-number shaped values
+]
+
+# Benign collocations that would otherwise match; only overlapping matches are suppressed.
+ALLOWLIST = [
+    r"\bethical\s+hacking\b",
+    r"\b(?:how\s+to\s+)?prevent\s+phishing\b", r"\banti[- ]phishing\b",
+    r"\blife\s*hacks?\b", r"\bgrowth\s+hack(?:ing|er|ers)?\b", r"\bhack\s+together\b",
+    r"\bbath\s+bombs?\b", r"\bphoto\s*bomb\w*\b",
+]
+
+# Defensive or test framing near a cyber match downgrades BLOCK to NEEDS_FIX ("protect my account
+# from someone trying to hack into it", "bypass authentication in Cypress tests"). It needs a verb
+# with an object, so nouns like "security defenses" don't count. Never applied to violence,
+# self-harm or sexual content.
+DEFENSIVE = re.compile(
+    r"\b(?:prevent|protect|defend|detect|mitigat|secur|harden|guard)\w*\s+(?:my|our|your|the|against|from|it|them|us)\b"
+    r"|\bhow\s+to\s+(?:avoid|stop)\b|\b(?:unit|integration|e2e|cypress|playwright|selenium|jest|pytest)\s+tests?\b"
+    r"|\bin\s+(?:my\s+|our\s+)?(?:tests?|test\s+suite|staging|local\s+dev\w*)\b", re.I)
+
+
+# Shown when a self-harm rule matches. findahelpline.com (run by ThroughLine; the directory the
+# International Association for Suicide Prevention links to) lists free, confidential helplines by country.
+SUPPORT_MESSAGE = ("If you are thinking about harming yourself, you don't have to go through it alone. "
+                   "If you are in immediate danger, call your local emergency number. "
+                   "To find a free, confidential helpline in your country, visit https://findahelpline.com. "
+                   "This tool is not a crisis service.")
 
 
 class BrokerDecision(Enum):
     """Broker decision types"""
-    ALLOW = "ALLOW"           # Safe to proceed with LLM enhancement
-    NEEDS_FIX = "NEEDS_FIX"   # Contains potentially risky content, needs sanitization or clarification
-    BLOCK = "BLOCK"           # Too dangerous, block completely
+    ALLOW = "ALLOW"           # No rule matched
+    NEEDS_FIX = "NEEDS_FIX"   # Sensitive/ambiguous term: warn, then process the prompt unchanged
+    BLOCK = "BLOCK"           # Harmful-intent phrase: stop
 
 
 class ISTVONBroker:
 
     def __init__(self):
-        self.pattern_matcher = ISTVONPatternMatcher()
         self.context_analyzer = ContextAnalyzer()
-        self.llm_mapper = LLMISTVONMapper()
-        self.completion_engine = ISTVONCompletionEngine()
-        self.schema_validator = ISTVONSchema()
         self.json_logger = RuleEngineLogger()
-
-        # Build precompiled unsafe pattern lists (single words use word boundaries)
-        self.unsafe_patterns = {
-            "malicious": [
-                r"hack\b", r"exploit\b", r"attack\b", r"malware\b", r"virus\b", r"trojan\b",
-                r"phish(?:ing)?\b", r"inject(?:ion)?\b", r"brute\s*force\b",
-                r"ransomware\b", r"keylogger\b", r"spyware\b", r"rootkit\b",
-                r"steal(?:ing)?\b", r"data\s*theft\b", r"credential\s*harvest(?:ing)?\b",
-                r"data\s*breach\b", r"unauthorized\s*access\b"
-            ],
-            "inappropriate": [
-                r"explicit\b", r"pornographic\b", r"adult content", r"hate speech", r"discrimination",
-                r"racist\b", r"harassment\b", r"bully(?:ing|ied)?\b"
-            ],
-            "sensitive": [
-                r"personal data\b", r"private information\b", r"confidential\b",
-                r"financial\b", r"bank(?:ing)?\b", r"credit card\b", r"\bssn\b",
-                r"medical\b", r"health records\b", r"patient data\b"
-            ],
-            "dangerous": [
-                r"\b(?:make|making|build|building|create|creating|assemble|assembling)\s+(?:an?\s+)?(?:\w+\s+){0,2}(?:explosives?|bombs?|weapons?)\b",
-                r"how to kill\b", r"how to harm\b", r"how to hurt\b", r"suicide\b", r"\bunalive\b",
-                r"attack(?: people)?\b", r"illegal\b", r"drug manufacture\b", r"poison recipe\b"
-            ]
-        }
-        # Compile patterns for performance and case-insensitivity
-        self.compiled_unsafe = {
-            cat: [re.compile(p, re.IGNORECASE) for p in patterns]
-            for cat, patterns in self.unsafe_patterns.items()
-        }
-
-        # Numeric severity scoring per category (tunable)
-        self.severity_score_map = {
-            "malicious": 5,
-            "dangerous": 5,
-            "sensitive": 3,
-            "inappropriate": 2
-        }
-
-        # Allowlist patterns (benign collocations that would otherwise match)
-        self.allowlist_patterns = [
-            re.compile(r"\bhackathon\b", re.IGNORECASE),
-            re.compile(r"\bethical hacking\b", re.IGNORECASE),
-            re.compile(r"\bpenetration testing\b", re.IGNORECASE),
-            re.compile(r"\bhow to prevent phishing\b", re.IGNORECASE),
-            re.compile(r"\bprevent phishing\b", re.IGNORECASE),
-            re.compile(r"\banti[- ]phishing\b", re.IGNORECASE),
-        ]
-
-        # Mitigation/intent words that indicate a benign/defensive intent nearby
-        self.mitigation_indicators = [
-            r"prevent", r"avoid", r"stop", r"protect", r"secure", r"defend", r"mitigate",
-            r"how to prevent", r"how to avoid", r"how to stop"
-        ]
-        self.mitigation_res = [re.compile(r'\b' + w + r'\b', re.IGNORECASE) for w in self.mitigation_indicators]
+        self.safety_rules = [(cat, level, re.compile(p, re.IGNORECASE)) for cat, level, p in SAFETY_RULES]
+        self.allowlist_patterns = [re.compile(p, re.IGNORECASE) for p in ALLOWLIST]
 
         # COSTAR gap patterns (unchanged semantics but compiled)
         self.costar_gaps = {
@@ -93,11 +109,6 @@ class ISTVONBroker:
             "audience": [re.compile(r"\b(for|target|audience|recipient|customers|users|people)\b", re.I)],
             "resources": [re.compile(r"\b(using|with|tools|resources|via|through)\b", re.I)]
         }
-
-        # Tunable thresholds (kept in-class to avoid changing other files)
-        self._high_risk_threshold = 5   # score >= this -> high risk
-        self._medium_risk_threshold = 2  # score >= this -> medium risk
-        self._completeness_threshold = 0.3  # below this -> needs enhancement
 
     def analyze_prompt(self, prompt: str) -> Dict[str, Any]:
         """Analyze prompt and make broker decision"""
@@ -122,78 +133,34 @@ class ISTVONBroker:
         }
 
     def _analyze_safety(self, prompt: str) -> Dict[str, Any]:
-        """Analyze prompt for unsafe content with context-aware filtering"""
-        prompt_lower = prompt.lower()
+        """Match the safety rules; the worst single match sets the risk level."""
+        allow_spans = [m.span() for allow_re in self.allowlist_patterns for m in allow_re.finditer(prompt)]
         issues = []
-        total_score = 0
+        for category, level, cre in self.safety_rules:
+            for m in cre.finditer(prompt):
+                start, end = m.span()
+                if any(start < a_end and end > a_start for a_start, a_end in allow_spans):
+                    continue
+                score = level
+                if level == BLOCK_LEVEL and category == "malicious" and \
+                        DEFENSIVE.search(prompt[max(0, start - 60):end + 60]):
+                    score = REVIEW_LEVEL  # defensive framing: flag, don't block
+                issues.append({
+                    "category": category,
+                    "pattern": cre.pattern,
+                    "match": m.group(0),
+                    "span": (start, end),
+                    "severity": "block" if score == BLOCK_LEVEL else "review",
+                    "score": score,
+                })
 
-        # Compute allowlist match spans so only overlapping unsafe matches are suppressed
-        allow_spans = [
-            m.span()
-            for allow_re in self.allowlist_patterns
-            for m in allow_re.finditer(prompt)
-        ]
-
-        # For every compiled pattern, find matches but skip allowlisted spans or mitigation contexts
-        for category, patterns in self.compiled_unsafe.items():
-            for cre in patterns:
-                for m in cre.finditer(prompt):
-                    match_text = m.group(0)
-                    span = m.span()
-                    if any(not (span[1] <= a_start or span[0] >= a_end) for a_start, a_end in allow_spans):
-                        continue
-
-                    # Check for allowlist in a small window (20 chars before/after)
-                    window_start = max(0, span[0] - 40)
-                    window_end = min(len(prompt), span[1] + 40)
-                    window = prompt[window_start:window_end]
-
-                    # If mitigation indicators are present in the window, treat as a benign context
-                    if any(r.search(window) for r in self.mitigation_res):
-                        # lower severity: record but with reduced score
-                        issue_score = max(1, int(self.severity_score_map.get(category, 1) / 2))
-                        issues.append({
-                            "category": category,
-                            "pattern": cre.pattern,
-                            "match": match_text,
-                            "span": span,
-                            "severity": "low_context",
-                            "score": issue_score,
-                            "context_window": window.strip()
-                        })
-                        total_score += issue_score
-                        continue
-
-                    # Otherwise, normal handling
-                    issue_score = self.severity_score_map.get(category, 1)
-                    issues.append({
-                        "category": category,
-                        "pattern": cre.pattern,
-                        "match": match_text,
-                        "span": span,
-                        "severity": "normal",
-                        "score": issue_score
-                    })
-                    total_score += issue_score
-
-        # Apply multi-category bonus: if matches span 2+ distinct categories, add bonus
-        matched_categories = set(i.get("category") for i in issues if i.get("severity") == "normal")
-        if len(matched_categories) >= 2:
-            total_score += len(matched_categories)  # bonus per distinct category
-
-        # Determine overall risk level using numeric thresholds
-        if total_score >= self._high_risk_threshold:
-            risk_level = "high"
-        elif total_score >= self._medium_risk_threshold:
-            risk_level = "medium"
-        else:
-            risk_level = "low"
-
+        score = max((i["score"] for i in issues), default=0)
+        risk_level = "high" if score >= BLOCK_LEVEL else "medium" if score >= REVIEW_LEVEL else "low"
         return {
             "risk_level": risk_level,
             "issues": issues,
             "is_safe": risk_level == "low",
-            "score": total_score,
+            "score": score,
             "matches": issues  # keep same field name for compatibility
         }
 
@@ -235,28 +202,31 @@ class ISTVONBroker:
         """Get recommendations based on broker decision; returns both human and structured recommendations"""
         recommendations = []
 
+        if any(i.get("category") == "self_harm" for i in safety_result.get("issues", [])):
+            # Region-neutral on purpose: no country-specific numbers to go stale or be wrong abroad.
+            # Only the support message: "revise your prompt" boilerplate reads badly here.
+            return [SUPPORT_MESSAGE]
+
         if decision == BrokerDecision.BLOCK:
             recommendations.append("BLOCKED: Content contains high-risk elements.")
             recommendations.append("Revise your prompt to remove instructions for harmful or illegal activities.")
-            # provide structured suggestion for UI or API consumers
-            recommendations.append(json.dumps({"action": "remove_high_risk_content"}))
 
         elif decision == BrokerDecision.NEEDS_FIX:
             if safety_result["risk_level"] != "low":
-                recommendations.append("Contains potentially unsafe content; consider rephrasing or redacting sensitive terms.")
-                recommendations.append(json.dumps({"action": "sanitize_or_rephrase"}))
+                recommendations.append("Contains potentially unsafe content or sensitive data; consider rephrasing. "
+                                       "The prompt is processed as written (and sent to the LLM if one is configured), "
+                                       "so leave out real personal data such as names, account or card numbers.")
 
             if costar_gaps["missing_elements"]:
-                rec = "Missing critical elements: " + ", ".join(costar_gaps["missing_elements"])
-                recommendations.append(rec)
-                recommendations.append(json.dumps({"action": "add_context", "missing": costar_gaps["missing_elements"]}))
+                recommendations.append("Missing critical elements: " + ", ".join(costar_gaps["missing_elements"]))
             else:
                 recommendations.append("Consider clarifying objectives or audience for better results.")
         else:  # ALLOW
             recommendations.append("Safe to proceed with ISTVON enhancement.")
             if costar_gaps["completeness_score"] < 0.8:
-                recommendations.append("Consider adding more details for better results.")
-                recommendations.append(json.dumps({"action": "consider_more_details"}))
+                missing = costar_gaps.get("missing_elements") or []
+                recommendations.append("Consider adding more details for better results"
+                                       + (f" (missing: {', '.join(missing)})." if missing else "."))
 
         return recommendations
 
@@ -290,11 +260,12 @@ class ISTVONBroker:
             return broker_result
 
         elif decision == BrokerDecision.NEEDS_FIX:
-            # Sanitize and enhance but keep original prompt for audit
-            sanitized_info = self._sanitize_prompt(prompt, analysis)
-            sanitized_prompt = sanitized_info.get("sanitized_prompt")
-            redactions = sanitized_info.get("redactions")
-            suggested_rewrite = sanitized_info.get("suggested_rewrite")
+            # Build a redacted copy for the audit log only. The caller still processes the
+            # original prompt unchanged; nothing here keeps text away from the LLM provider.
+            audit_info = self._redact_for_audit(prompt, analysis)
+            sanitized_prompt = audit_info.get("sanitized_prompt")
+            redactions = audit_info.get("redactions")
+            suggested_rewrite = audit_info.get("suggested_rewrite")
 
             enhanced_prompt = self._enhance_prompt(sanitized_prompt, analysis)
 
@@ -318,18 +289,19 @@ class ISTVONBroker:
             })
             return broker_result
 
-    def _sanitize_prompt(self, prompt: str, analysis: Dict = None) -> Dict[str, Any]:
-        """Sanitize prompt by redacting risky tokens and returning a suggested rewrite.
+    def _redact_for_audit(self, prompt: str, analysis: Dict = None) -> Dict[str, Any]:
+        """Replace the matched rule spans with [REDACTED] for the audit-log copy.
 
-        Returns a dict with:
-        - sanitized_prompt: str
+        Only rule matches are replaced; names, addresses and other personal data that no
+        rule matches stay in the text. Returns a dict with:
+        - sanitized_prompt: str (key named after the prompt_log column)
         - redactions: list of dict(original, replacement, category, span)
         - suggested_rewrite: str (a simple human-friendly suggestion)
         """
         if not prompt:
             return {"sanitized_prompt": "", "redactions": [], "suggested_rewrite": ""}
 
-        sanitized = prompt
+        text = prompt
         redactions = []
 
         # Use the safety analysis matches if provided (more precise spans), else compute matches
@@ -348,7 +320,7 @@ class ISTVONBroker:
                 span = m.get("span")
                 if not span:
                     # try to find text occurrence
-                    idx = sanitized.lower().find(m.get("match", "").lower())
+                    idx = text.lower().find(m.get("match", "").lower())
                     if idx >= 0:
                         span = (idx, idx + len(m.get("match", "")))
                     else:
@@ -380,11 +352,11 @@ class ISTVONBroker:
         last_idx = 0
         for s in merged:
             start, end, replacement, original, category = s
-            out.append(sanitized[last_idx:start])
+            out.append(text[last_idx:start])
             out.append(replacement)
             redactions.append({"original": original, "replacement": replacement, "category": category, "span": (start, end)})
             last_idx = end
-        out.append(sanitized[last_idx:])
+        out.append(text[last_idx:])
         sanitized_prompt = "".join(out).strip()
 
         # Build a very conservative suggested rewrite: replace REDACTED with a descriptive placeholder
@@ -403,7 +375,7 @@ class ISTVONBroker:
         }
 
     def _enhance_prompt(self, prompt: str, analysis: Dict) -> str:
-        """Enhance prompt by adding missing COSTAR elements (same behaviour as before but safe to call with sanitized prompt)."""
+        """Append guidance for missing COSTAR elements (result is returned but not used by the app)."""
         enhanced = prompt or ""
         gaps = analysis.get("costar_gaps", {}).get("missing_elements", [])
 
@@ -445,7 +417,7 @@ class ISTVONBroker:
             safety_level = analysis.get("safety_analysis", {}).get("risk_level")
             gaps = analysis.get("costar_gaps", {}).get("missing_elements", [])
             if safety_level and safety_level != "low":
-                return "Content needs sanitization due to safety concerns"
+                return "Sensitive or risky wording flagged for review"
             elif gaps:
                 return "Content needs enhancement - missing: " + ", ".join(gaps)
             else:

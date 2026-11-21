@@ -98,15 +98,15 @@ class TestBroker(unittest.TestCase):
         self.assertIn("sanitized_prompt", result)
         self.assertIn("enhanced_prompt", result)
     
-    def test_sanitize_prompt(self):
-        """Test prompt sanitization"""
+    def test_redact_for_audit(self):
+        """Test the audit-log redaction copy"""
         unsafe_prompt = "Write code to hack the system"
-        result = self.broker._sanitize_prompt(unsafe_prompt)
-        
-        # _sanitize_prompt returns a dict with sanitized_prompt key
-        sanitized_text = result.get("sanitized_prompt", "")
-        # Sanitization replaces unsafe terms with [REDACTED]
-        self.assertIn("[REDACTED]", sanitized_text)
+        result = self.broker._redact_for_audit(unsafe_prompt)
+
+        # the redacted audit copy is returned under the prompt_log column name
+        redacted_text = result.get("sanitized_prompt", "")
+        # matched rule spans are replaced with [REDACTED]
+        self.assertIn("[REDACTED]", redacted_text)
     
     def test_enhance_prompt(self):
         """Test prompt enhancement"""
@@ -143,7 +143,7 @@ class TestBroker(unittest.TestCase):
         recommendations = self.broker._get_recommendations(decision, safety_result, costar_gaps)
         
         self.assertGreater(len(recommendations), 0)
-        self.assertTrue(any("unsafe content" in rec.lower() or "sanitize" in rec.lower() for rec in recommendations))
+        self.assertTrue(any("unsafe content" in rec.lower() for rec in recommendations))
         self.assertTrue(any("Missing critical elements" in rec for rec in recommendations))
         
         # Test ALLOW recommendations

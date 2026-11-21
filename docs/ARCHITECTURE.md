@@ -1,7 +1,7 @@
 # Architecture: ISTVON Prompt Enhancement Engine
 
 ## 1. Purpose & Scope
-The **ISTVON Prompt Enhancement Engine** is a dual-tier prompt engineering, governance, and transformation system designed for developers, enterprise AI operators, and end-users who need to convert ambiguous, unstructured natural language prompts into deterministic, machine-readable, and guardrailed prompt specifications. It solves the unpredictability, prompt injection vulnerabilities, and incomplete context of raw LLM prompts by enforcing the **ISTVON** structural framework (**I**nstructions, **S**ources, **T**ools, **V**ariables, **O**utcome, **N**otifications) paired with **COSTAR** gap analysis, two-stage safety brokerage (RegEx heuristic filtering + LLM semantic sanitizability validation), and seamless offline fallback execution.
+The **ISTVON Prompt Enhancement Engine** is a dual-tier prompt engineering, governance, and transformation system designed for developers, enterprise AI operators, and end-users who need to convert ambiguous, unstructured natural language prompts into deterministic, machine-readable, and guardrailed prompt specifications. It solves the unpredictability, prompt injection vulnerabilities, and incomplete context of raw LLM prompts by enforcing the **ISTVON** structural framework (**I**nstructions, **S**ources, **T**ools, **V**ariables, **O**utcome, **N**otifications) paired with **COSTAR** gap analysis, two-stage safety brokerage (RegEx heuristic filtering + an LLM safety check), and a basic offline fallback. It does **not** protect personal data: prompts are sent to the configured LLM provider as typed (see Design Decision 3).
 
 ---
 
@@ -15,22 +15,22 @@ flowchart TD
     
     subgraph Governance & Safety Layer
         Engine -->|Step 1: Inspect Safety & Gaps| Broker[ISTVONBroker: engine/broker.py]
-        Broker -->|Compile Regex & Check Mitigation Context| SafetyEval{Safety Verdict}
-        SafetyEval -->|Score >= 5: BLOCK| BlockEarly[Return Block Response & Log Decision]
-        SafetyEval -->|Score 2-4: NEEDS_FIX| Sanitize[Redact Sensitive Spans & Suggest Rewrite]
-        SafetyEval -->|Score < 2: ALLOW| AllowSafe[Pass to Pipeline]
-        Sanitize --> ValidateSanitize[LLMMapper.validate_sanitizability]
-        AllowSafe --> ValidateSanitize
-        ValidateSanitize -->|Unsanitizable Malicious Intent| BlockEarly
+        Broker -->|Worst single regex match| SafetyEval{Safety Verdict}
+        SafetyEval -->|Harmful-intent phrase: BLOCK| BlockEarly[Return Block Response & Log to JSON + prompt_log]
+        SafetyEval -->|Sensitive / ambiguous term: NEEDS_FIX| Flag[Warn in UI; raw prompt continues; redacted copy only in prompt_log]
+        SafetyEval -->|No match: ALLOW| AllowSafe[Pass to Pipeline]
+        Flag --> LLMSafety[LLMMapper.check_prompt_safety]
+        AllowSafe --> LLMSafety
+        LLMSafety -->|safe: false| BlockEarly
     end
     
     subgraph Analysis & Transformation Pipeline
-        ValidateSanitize -->|Step 3: Context Analysis| CtxAnalyzer[ContextAnalyzer: engine/context_analyzers.py]
+        LLMSafety -->|Step 3: Context Analysis| CtxAnalyzer[ContextAnalyzer: engine/context_analyzers.py]
         CtxAnalyzer -->|Domain, Complexity, Specificity| Prelim[ISTVONEngine._create_preliminary_mapping]
         Prelim -->|Draft Mapping| LLMMapper[LLMISTVONMapper: engine/llm_mapper.py]
         
-        LLMMapper -->|Has Valid Gemini Key & Model| GeminiAPI[(Google Gemini API: Configured GEMINI_MODEL)]
-        LLMMapper -->|No API Key / Error Fallback| RuleFallback[Rule-based Preliminary Map]
+        LLMMapper -->|Gemini or Groq key + model| GeminiAPI[(LLM API: Gemini GEMINI_MODEL or Groq GROQ_MODEL)]
+        LLMMapper -->|No API Key / Error Fallback| RuleFallback[Pattern-matcher Preliminary Map]
         GeminiAPI -->|Raw JSON / Text| JSONParser[JSONParser: utils/json_parser.py]
         JSONParser -->|Merged ISTVON Map| Completion[ISTVONCompletionEngine: engine/completion_rules.py]
         RuleFallback --> Completion
@@ -52,13 +52,13 @@ flowchart TD
 
 ### Component Communication Mechanisms
 1. **Synchronous In-Process Function Calls**: All core processing hops (`app.py` → `ISTVONEngine` → `ISTVONBroker` → `ContextAnalyzer` → `LLMISTVONMapper` → `ISTVONCompletionEngine` → `ISTVONSchema`) execute synchronously within the Python runtime.
-2. **External HTTP / REST API (Google Gemini)**: `LLMISTVONMapper` (shared by `ISTVONEngine.generate_response_with_istvon`) calls Google's Gemini API using the `google-genai` SDK (`genai.Client`) over HTTPS with `HttpOptions` timeouts.
-3. **Database Protocol (TCP/IP via libpq/psycopg2)**: `DatabaseManager` connects to PostgreSQL via `psycopg2` using connection pooling parameters or a `DATABASE_URL` connection string.
+2. **External HTTP / REST API (Gemini or Groq)**: `LLMISTVONMapper` (shared by `ISTVONEngine.generate_response_with_istvon`) calls Google's Gemini API using the `google-genai` SDK (`genai.Client`) with `HttpOptions` timeouts, or Groq's OpenAI-compatible chat-completions endpoint via a small stdlib `urllib` client (`GroqClient`). `LLM_PROVIDER` picks one when both keys are set; default is Gemini first.
+3. **Database Protocol (TCP/IP via libpq/psycopg2)**: `DatabaseManager` opens a single `psycopg2` connection (no pooling) from the `POSTGRES_*` parameters or a `DATABASE_URL` connection string. The Streamlit app builds one engine per server process (`st.cache_resource`), so one connection is reused.
 4. **Local Append-Only File Streams**: Synchronous file writes append line-delimited JSON objects to `rule_engine_logs.json` and `istvon_transformations_log.json`.
 
 ### State Lifecycle and Flow
 - **Streamlit Session State (`st.session_state`)**: Manages the transient UI state across user interactions. Keys include `istvon_result` (the structured mapping and broker metadata), `original_prompt` (user input string), and `generated_response` (LLM-generated output text).
-- **Processing State (`dict`)**: Passed down the pipeline as an evolving dictionary containing `I`, `S`, `T`, `V`, `O`, `N` structures, context metadata (`domain`, `complexity`, `specificity`), and broker decisions (`verdict`, `reason`, `sanitized_prompt`).
+- **Processing State (`dict`)**: Passed down the pipeline as an evolving dictionary containing `I`, `S`, `T`, `V`, `O`, `N` structures, context metadata (`domain`, `complexity`, `specificity`), and broker decisions (`verdict`, `reason`, and for NEEDS_FIX `sanitized_prompt`, the `[REDACTED]` audit copy; the name follows the `prompt_log` column, nothing is sanitized before use).
 - **Telemetry State**: Persisted across two audit trails:
   - Local JSON lines (`rule_engine_logs.json` and `istvon_transformations_log.json`).
   - Relational PostgreSQL database (`prompt_log` table) when connection credentials exist.
@@ -69,14 +69,14 @@ flowchart TD
 
 | Technology | Version / Spec | Purpose & Architectural Justification |
 | :--- | :--- | :--- |
-| **Python** | 3.9+ (tested 3.11.9) | Core language. Selected for ecosystem compatibility with AI libraries, regex performance, and rapid string manipulation. |
+| **Python** | 3.11.9 tested; 3.13+ unsupported (no `numpy<2` wheels) | Core language. Selected for ecosystem compatibility with AI libraries, regex performance, and rapid string manipulation. |
 | **Streamlit** | `1.28.0` | Frontend web interface. Chosen to avoid complex React/Node.js build pipelines while providing reactive UI components (session state, tabs, JSON viewers, file downloads). |
 | **NumPy / PyArrow** | `numpy<2,>=1.19.3`, `pyarrow>=6.0,<26` | Transitive data stack for Streamlit `1.28.0`. Pinned below `pyarrow 26` and `numpy 2.0` to prevent `pyarrow` ABI/import conflicts with `numpy 1.x`. |
-| **Google GenAI SDK** | `google-genai>=1.0.0` | Official GA LLM client (`genai.Client`) for Google Gemini models (uses `GEMINI_MODEL` from environment). Provides JSON-mode prompt completion, semantic sanitizability validation, and `HttpOptions` request timeouts. |
+| **Google GenAI SDK** | `google-genai>=1.0.0` | Official GA LLM client (`genai.Client`) for Google Gemini models (uses `GEMINI_MODEL` from environment). Provides JSON-mode prompt completion, the LLM safety check, and `HttpOptions` request timeouts. Groq needs no SDK: it is called with stdlib `urllib`. |
 | **psycopg2-binary** | `>=2.9.0` | PostgreSQL client driver. Chosen for native JSONB indexing support, parameterized queries, and low-latency database telemetry. |
 | **python-dotenv** | `1.0.0` | Environment variable loader. Isolates secrets (`GEMINI_API_KEY`, DB credentials) from source code (`override=True`), with a manual fallback parser in `config.py` if the library is absent. |
-| **re** | Standard Library | Pattern matching engine. Drives safety heuristic scoring, mitigation window context checks, allowlist span filtering, keyword extraction, and COSTAR gap analysis. |
-| **Pytest** | `pytest>=8.0.0` | Automated test runner. Executes 44 unit tests covering broker logic, `google-genai` client initialization/mocking, fallback merging, regex parsers, placeholder checks, and schema validation. |
+| **re** | Standard Library | Pattern matching engine. Drives safety rule matching, defensive-framing checks, allowlist span filtering, keyword extraction, and COSTAR gap analysis. |
+| **Pytest** | `pytest>=8.0.0` | Automated test runner. Executes 104 tests covering the `process_prompt` pipeline, the offline Streamlit app (`AppTest`), broker logic, `google-genai` client initialization/mocking, fallback merging, regex parsers, placeholder checks, and schema validation. |
 
 ---
 
@@ -107,16 +107,18 @@ ISTVON_Prompt_Enhancement_Engine/
 │   ├── helpers.py
 │   ├── json_logger.py
 │   ├── json_parser.py
-│   ├── logger.py
-│   └── validators.py
+│   └── logger.py
 ├── tests/
+│   ├── conftest.py
+│   ├── test_app_offline.py
 │   ├── test_broker.py
+│   ├── test_broker_rules.py
 │   ├── test_llm_mapper.py
+│   ├── test_pipeline.py
 │   └── test_rules.py
-├── examples/
-│   ├── sample_outputs.json
-│   └── sample_prompts.txt
-└── exports/
+└── examples/
+    ├── sample_outputs.json
+    └── sample_prompts.txt
 ```
 
 ### Module Responsibilities & Misleading Name Flags
@@ -124,17 +126,16 @@ ISTVON_Prompt_Enhancement_Engine/
 - **`config.py`**: Central configuration registry; loads `.env`, defines the static `ISTVON_SCHEMA` template, and holds domain-specific presets.
 - **`database.py`**: PostgreSQL database client and telemetry logger. Implements self-healing table setup and graceful silent degradation when the database is unavailable.
 - **`demo.py`**: Minimal standalone script demonstrating PostgreSQL `prompt_log` setup and insertion via `DatabaseManager` using environment configuration.
-- **`engine/broker.py`**: Core safety filter and COSTAR gap analyzer. Classifies prompts into `ALLOW`, `NEEDS_FIX`, or `BLOCK` using severity-weighted regex matching and context-window mitigation indicators.
-- **`engine/llm_mapper.py`**: Gemini API integration layer. Builds structural prompts, invokes LLM transformation, merges LLM outputs with rule-based drafts, and runs safety validation.
+- **`engine/broker.py`**: Core safety filter and COSTAR gap analyzer. Classifies prompts into `ALLOW`, `NEEDS_FIX`, or `BLOCK` from the worst single regex match (`SAFETY_RULES`), with an allowlist and defensive-framing downgrade for cyber terms.
+- **`engine/llm_mapper.py`**: Gemini / Groq integration layer. Builds structural prompts, invokes LLM transformation, merges LLM outputs with rule-based drafts, and runs safety validation.
 - **`engine/context_analyzers.py`**: Heuristic context detector. Calculates domain (`technical`, `business`, `creative`, `academic`, `communication`), complexity level (`simple`, `medium`, `complex`), and specificity scores.
 - **`engine/pattern_matchers.py`**: RegEx-based extraction engine for extracting preliminary instructions, sources, tools, variables, outcomes, and notifications directly from raw prompt text.
 - **`engine/completion_rules.py`**: Deterministic rule-based completion engine. Fills in missing ISTVON keys and injects domain-specific best-practice instructions and success criteria.
 - **`engine/istvon_schema.py`**: Schema enforcement layer. *(Flag: Misleading name — not a Pydantic Model or JSON-Schema library validator, but a hand-rolled dictionary type and required-key enforcer)*.
-- **`utils/json_parser.py`**: Robust JSON extraction and sanitization utility. Extracts JSON blobs from conversational LLM output and strips malicious HTML/script injections.
+- **`utils/json_parser.py`**: Extracts the first JSON object from LLM output (markdown fences or surrounding prose).
 - **`utils/json_logger.py`**: Appends newline-delimited JSON audit logs to `rule_engine_logs.json`.
 - **`utils/logger.py`**: Standard Python `logging` wrapper for stdout diagnostic logs.
 - **`utils/helpers.py`**: Formatting utilities (timestamps, text truncation) and sample prompt repository (`ExamplePrompts`).
-- **`utils/validators.py`**: Basic helper functions for JSON syntax and character sanitization. *(Flag: Partially redundant with `utils/json_parser.py`)*.
 - **`tests/`**: Unit test suite with mock support for offline testing.
 
 ---
@@ -150,30 +151,30 @@ ISTVON_Prompt_Enhancement_Engine/
   - `log_istvon_transformation(...)`: Writes end-to-end execution logs to `istvon_transformations_log.json`.
   - `main()`: Streamlit reactive UI lifecycle controller.
 - **Non-Obvious Details**:
-  - `process_prompt` executes a **two-phase safety check**: Phase 1 is the local Regex Broker (`ISTVONBroker`), and Phase 2 is an LLM-based semantic validator (`LLMISTVONMapper.validate_sanitizability`).
+  - `process_prompt` executes a **two-phase safety check**: Phase 1 is the local Regex Broker (`ISTVONBroker`), and Phase 2 is an LLM safety check (`LLMISTVONMapper.check_prompt_safety`), which fails open (skipped, `llm_checked: False`) when no LLM answers.
   - When a prompt is blocked at Phase 2, `app.py` directly instantiates `RuleEngineLogger` to write a local log entry before halting.
 
 ### 2. `engine/broker.py`
 - **Why it's critical**: The primary safety governance and prompt completeness evaluation engine. Enforces security boundaries and performs COSTAR gap analysis.
 - **Key Functions/Classes**:
   - `BrokerDecision(Enum)`: Enum with values `ALLOW`, `NEEDS_FIX`, `BLOCK`.
-  - `ISTVONBroker.__init__()`: Precompiles regex pattern maps for malicious, inappropriate, sensitive, and dangerous categories alongside allowlists and mitigation keywords.
+  - `ISTVONBroker.__init__()`: Precompiles the module-level `SAFETY_RULES` (category, level, pattern for dangerous, self_harm, malicious, inappropriate, sensitive) and `ALLOWLIST`.
   - `ISTVONBroker.analyze_prompt(prompt)`: Evaluates safety risks and COSTAR completeness.
-  - `ISTVONBroker._analyze_safety(prompt)`: Calculates numeric severity score with a **40-character window-based mitigation check** (e.g., reduces score if preceded by words like "prevent" or "secure").
-  - `ISTVONBroker.process_with_broker(prompt)`: Orchestrates analysis, logging, sanitization (redaction), and enhancement.
-  - `ISTVONBroker._sanitize_prompt(prompt, analysis)`: Performs span-based redactions replacing risky tokens with `[REDACTED]` and suggests rephrasing.
+  - `ISTVONBroker._analyze_safety(prompt)`: Takes the worst single rule match (BLOCK level 5, review level 2). A cyber BLOCK match with defensive or test framing within 60 characters (`DEFENSIVE`) is lowered to review level.
+  - `ISTVONBroker.process_with_broker(prompt)`: Orchestrates analysis, logging, and (for NEEDS_FIX) the redacted audit copy.
+  - `ISTVONBroker._redact_for_audit(prompt, analysis)`: Replaces matched rule spans with `[REDACTED]` for the audit-log copy only. Personal data no rule matches (names, addresses) stays in it, and the original prompt is what gets processed.
+  - `SUPPORT_MESSAGE`: region-neutral support text, shown as the only recommendation when a self-harm rule matches (emergency number + https://findahelpline.com). The tool is not a crisis service.
 - **Non-Obvious Details**:
-  - Allowlist patterns (e.g., `ethical hacking`, `penetration testing`, `prevent phishing`) suppress only overlapping unsafe pattern spans rather than short-circuiting the entire prompt, so unrelated dangerous or malicious terms elsewhere in the prompt are still evaluated.
-  - If matches span ≥ 2 distinct unsafe categories, an extra multi-category penalty bonus is added to `total_score`, triggering an immediate `BLOCK`.
+  - Allowlist patterns (e.g., `ethical hacking`, `prevent phishing`, `bath bombs`) suppress only overlapping unsafe pattern spans rather than short-circuiting the entire prompt, so unrelated dangerous or malicious terms elsewhere in the prompt are still evaluated.
   - COSTAR gaps do **not** block or force `NEEDS_FIX` on an otherwise safe prompt; they only produce structured UI recommendations.
 
 ### 3. `engine/llm_mapper.py`
-- **Why it's critical**: Manages all interactions with the Google Gemini API, including structural prompt generation, LLM response extraction, dictionary merging, and safety sanitizability classification.
+- **Why it's critical**: Manages all LLM calls (Gemini via `google-genai`, Groq via stdlib HTTP), including structural prompt generation, LLM response extraction, dictionary merging, and the LLM safety check.
 - **Key Functions/Classes**:
-  - `LLMISTVONMapper.__init__(api_key=_UNSET, model_name=_UNSET)`: Initializes `google.genai.Client` (configured with millisecond `types.HttpOptions`) using a sentinel `_UNSET` pattern to distinguish between unpassed arguments and explicit `None` (vital for test isolation).
+  - `LLMISTVONMapper.__init__(api_key=_UNSET, model_name=_UNSET, provider=_UNSET)`: With no arguments, uses `Config.llm_settings()` (Gemini, then Groq, or `LLM_PROVIDER`). Initializes `google.genai.Client` (millisecond `types.HttpOptions`) or `GroqClient`. The `_UNSET` sentinel distinguishes unpassed arguments from explicit `None` (which forces offline mode in tests).
   - `LLMISTVONMapper.enhance_mapping(natural_prompt, preliminary_map, context)`: Sends structured instructions to Gemini to complete missing ISTVON elements, falling back to rule-based mapping on any failure.
   - `LLMISTVONMapper._merge_mappings(rule_based, llm_enhanced)`: Intelligently merges rule-based dictionary keys and LLM-generated dictionary keys while preserving insertion order.
-  - `LLMISTVONMapper.validate_sanitizability(prompt)`: Uses Gemini to identify social engineering, phishing, credential harvesting, or guardrail bypass attempts hidden behind benign framing (e.g., "for educational research").
+  - `LLMISTVONMapper.check_prompt_safety(prompt)`: Asks the LLM for `{"safe": bool, "reason": str}` to identify social engineering, phishing, credential harvesting, or guardrail bypass attempts hidden behind benign framing (e.g., "for educational research").
 - **Non-Obvious Details**:
   - In `_merge_mappings`, list values (such as `I` and `T`) are deduplicated using order-preserving logic to maintain correct sequential execution steps.
 
@@ -198,22 +199,19 @@ ISTVON_Prompt_Enhancement_Engine/
   - Always enforces at least one instruction in `I` (`"Execute the requested task effectively"` if empty) and guarantees required `O` keys (`format`, `delivery`, `success_criteria`).
 
 ### 6. `utils/json_parser.py`
-- **Why it's critical**: Prevents malformed LLM responses from crashing the application and cleans dangerous HTML/XSS vectors from LLM outputs.
+- **Why it's critical**: Prevents malformed LLM responses from crashing the application.
 - **Key Functions/Classes**:
-  - `JSONParser.parse_gemini_response(response_text)`: 4-stage pipeline (Extract → Safe Parse → Structure Validate → Sanitize).
+  - `JSONParser.extract_and_parse(text)`: Returns the first JSON object found in the text, or `None`.
   - `JSONParser._extract_json(text)`: Balanced bracket extraction of JSON blobs enclosed in `{...}` or `[...]` to discard conversational markdown wrapper text without greedy regex truncation.
-  - `JSONParser._sanitize_text(text)`: Aggressive 4-step sanitizer removing dangerous tags (`<script>`, `<iframe>`, `<style>`) including their internal contents, followed by remaining HTML tags and special characters (`<`, `>`, `"`, `'`, `&`, `;`).
-  - `JSONParser.is_valid_istvon(data)`: Validates mandatory existence and types of keys `I` and `O`.
 - **Non-Obvious Details**:
-  - The sanitizer explicitly strips single and double quotes (`"` and `'`), which can alter prompt grammar if used directly on prompt instructions.
+  - LLM output is not HTML-cleaned; Streamlit renders the response as Markdown.
 
 ### 7. `database.py`
-- **Why it's critical**: Provides enterprise-grade PostgreSQL telemetry logging, analytics aggregation, and audit persistence.
+- **Why it's critical**: Optional PostgreSQL audit log.
 - **Key Functions/Classes**:
   - `DatabaseManager.setup_database()`: Creates table `prompt_log` with `JSONB` support and timestamp/verdict indexes.
-  - `DatabaseManager.log_transformation(...)`: Inserts full audit records with timestamp, original prompt, verdict, reason, sanitized prompt, final response, and `istvon_map_json`.
-  - `DatabaseManager.get_analytics()`: Computes aggregate metrics (`total_transformations`, `avg_prompt_length`, `success_rate`).
-  - `DatabaseManager.import_from_json_file(json_filepath)`: Ingests existing JSON log exports directly into PostgreSQL.
+  - `DatabaseManager.log_transformation(...)`: Inserts one audit row (timestamp, original prompt, verdict, reason, redacted copy for NEEDS_FIX, `istvon_map_json`) and returns its id.
+  - `DatabaseManager.log_response(row_id, response)`: Stores the generated response on that row.
 - **Non-Obvious Details**:
   - `DatabaseManager` wraps all connection and query failures in `try/except` blocks that print warnings but **never raise exceptions**, ensuring database downtime never interrupts prompt enhancement.
 
@@ -236,8 +234,8 @@ ISTVON_Prompt_Enhancement_Engine/
     │    ├── Calls _analyze_costar_gaps() -> Checks missing elements (context, timeline, audience)
     │    └── Calls context_analyzer.analyze_prompt_context() -> Domain = "technical"
     │
-    ├──> [Step 2.2] LLM Sanitizability Check: LLMISTVONMapper.validate_sanitizability() (engine/llm_mapper.py)
-    │    └── Calls Gemini with strict social engineering / harm rejection rules -> Returns sanitizable: True
+    ├──> [Step 2.2] LLM Safety Check: LLMISTVONMapper.check_prompt_safety() (engine/llm_mapper.py)
+    │    └── Calls the LLM with strict social engineering / harm rejection rules -> Returns safe: True
     │
     ├──> [Step 2.3] Context Analysis: ContextAnalyzer.analyze_prompt_context() (engine/context_analyzers.py)
     │    └── Returns: domain="technical", complexity="medium", specificity="medium", domain_rules={...}
@@ -299,8 +297,11 @@ Configuration is managed via `config.py`, which loads `.env` next to `config.py`
 ### Configuration Parameters
 | Parameter | Env Var Name | Default Value | Description / Failure Mode |
 | :--- | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | `GEMINI_API_KEY` | `None` | Google Gemini API Key. If missing or a placeholder (`your_gemini_api_key_here`, `your-api-key-here`, etc.), LLM features disable automatically and the engine operates entirely in offline rule-based mode. |
-| `DEFAULT_MODEL` | `GEMINI_MODEL` | `""` *(empty string)* | Target Gemini model. If unset, a placeholder (`your_gemini_model_here`), or an invalid model ID, LLM initialization skips or falls back to rule-based mappings. |
+| `GEMINI_API_KEY` | `GEMINI_API_KEY` | `None` | Google Gemini API Key. If missing or a placeholder (`your_gemini_api_key_here`, `your-api-key-here`, etc.), Gemini is skipped. With no usable provider the engine runs in offline pattern-matcher mode. |
+| `DEFAULT_MODEL` | `GEMINI_MODEL` | `""` *(empty string)* | Target Gemini model. Required together with the key; if unset or a placeholder, Gemini is skipped. |
+| `GROQ_API_KEY` | `GROQ_API_KEY` | `None` | Groq API key (used when Gemini is not configured, or when `LLM_PROVIDER=groq`). |
+| `GROQ_MODEL` | `GROQ_MODEL` | `""` *(empty string)* | Groq model id, e.g. `openai/gpt-oss-120b`. Required together with the key. |
+| `LLM_PROVIDER` | `LLM_PROVIDER` | `""` | Optional: `gemini` or `groq` to force one provider when both are configured. |
 | `POSTGRES_HOST` | `POSTGRES_HOST` | `localhost` | PostgreSQL hostname. |
 | `POSTGRES_PORT` | `POSTGRES_PORT` | `5432` | PostgreSQL port number. |
 | `POSTGRES_DB` | `POSTGRES_DB` | `istvon_db` | Target PostgreSQL database name. |
@@ -321,7 +322,10 @@ Configuration is managed via `config.py`, which loads `.env` next to `config.py`
 ### 1. External APIs Consumed
 - **Google Generative AI REST API** (`https://generativelanguage.googleapis.com`):
   - Model: Configured via `GEMINI_MODEL` environment variable.
-  - Methods: `generate_content` for prompt schema structuring, safety sanitizability validation, and final response generation.
+  - Methods: `generate_content` for prompt schema structuring, the LLM safety check, and final response generation.
+- **Groq chat-completions API** (`https://api.groq.com/openai/v1/chat/completions`, OpenAI-compatible):
+  - Model: `GROQ_MODEL` (tested with `openai/gpt-oss-120b`). Called with stdlib `urllib`; JSON mode via `response_format: {"type": "json_object"}`.
+- Either way, the prompt text is sent to the provider as typed, including for NEEDS_FIX prompts.
 
 ### 2. Database Schema (PostgreSQL: `prompt_log`)
 ```sql
@@ -385,8 +389,8 @@ pip install -r requirements.txt
 ### Running the Web Application
 ```bash
 streamlit run app.py
-# If port 8501 is busy:
-streamlit run app.py --server.port 8502
+# If port 8501 is busy (or reserved on Windows):
+streamlit run app.py --server.port 8700
 ```
 
 ### Running Standalone Demo & Test Suite
@@ -394,19 +398,22 @@ streamlit run app.py --server.port 8502
 # Run standalone demo (attempts PostgreSQL connection)
 python demo.py
 
-# Run full pytest test suite (44 unit tests)
+# Run full pytest test suite (104 tests)
 python -m pytest tests/ -v
 ```
 
 ### Test Suite Scope
-- **What is covered**:
-  - `test_broker.py` (14 tests): Safe prompts (`ALLOW`), high-risk prompts (`BLOCK`), medium-risk prompts (`NEEDS_FIX`), bomb/self-harm pattern coverage, allowlist span isolation, COSTAR gap completeness scoring, span redactions, and structured recommendations.
-  - `test_llm_mapper.py` (20 tests): API key/model initialization sentinel isolation, `google.genai.Client` timeout & JSON-mode call assertions, placeholder detection, fallback when model is absent, `<user_prompt>` boundary fencing, prompt formatting, JSON extraction from markdown blocks, dictionary merging, and `JSONParser` HTML sanitization.
+- **What is covered** (tests run in a temp directory via `tests/conftest.py`, so the real JSON logs are untouched):
+  - `test_broker.py` (14 tests): Safe prompts (`ALLOW`), high-risk prompts (`BLOCK`), medium-risk prompts (`NEEDS_FIX`), bomb/self-harm pattern coverage, allowlist span isolation, COSTAR gap completeness scoring, span redactions, and recommendations.
+  - `test_broker_rules.py` (53 tests): verdicts on realistic prompts, including former false positives (bank report, "attack the bottleneck", "kill a child process") and harmful-intent phrasings, plus a 5000-character timing check.
+  - `test_pipeline.py` (10 tests): `ISTVONEngine.process_prompt` end to end with the LLM mocked and the database mocked: global config unchanged across calls, repeatable output, offline mapping uses prompt constraints and keeps words intact, BLOCKs written to `prompt_log`, a failing LLM safety call fails open and reports why, NEEDS_FIX sends the prompt unredacted, Groq request format, provider selection.
+  - `test_llm_mapper.py` (15 tests): API key/model initialization sentinel isolation, `google.genai.Client` timeout & JSON-mode call assertions, placeholder detection, fallback when model is absent, `<user_prompt>` boundary fencing, prompt formatting, JSON extraction from markdown blocks, and dictionary merging.
+  - `test_app_offline.py` (2 tests): runs `app.py` through Streamlit's `AppTest` with no LLM keys and no database: offline banner names the missing variables, a prompt is enhanced end to end, the "LLM safety check skipped" notice shows, Generate Response reports "No LLM configured"; plus the `LLM_PROVIDER=groq` without `GROQ_MODEL` hint.
   - `test_rules.py` (10 tests): RegEx pattern element extraction, context domain/complexity/specificity calculations, and deterministic completion rule enforcement.
 - **What is NOT covered**:
-  - Live PostgreSQL database transactions (all DB calls are decoupled or tested in offline mode).
-  - Live Google Gemini API end-to-end network requests (API calls in unit tests are mocked or run in offline fallback mode).
-  - Streamlit UI rendering and browser interaction.
+  - Live PostgreSQL database transactions (all DB calls are mocked in tests).
+  - Live Gemini / Groq network requests (API calls in unit tests are mocked or run in offline fallback mode).
+  - Browser interaction beyond the offline `AppTest` run.
 
 ---
 
@@ -415,16 +422,17 @@ python -m pytest tests/ -v
 1. **Dual-Tier Offline/Online Execution (Trade-off: Complexity vs. High Availability)**:
    - *Decision*: Build a complete rule-based heuristic engine (`ContextAnalyzer`, `ISTVONPatternMatcher`, `ISTVONCompletionEngine`) alongside the Gemini LLM integration.
    - *Rationale*: Allows the system to operate with zero configuration or API keys in air-gapped or offline development environments while enhancing output quality when API keys are provided.
-2. **Mitigation Window Context Evaluation (Trade-off: Heuristic Accuracy vs. False Positives)**:
-   - *Decision*: In `ISTVONBroker._analyze_safety`, search a 40-character window around flagged terms for defensive verbs ("prevent", "avoid", "protect", "secure").
-   - *Rationale*: Prevents legitimate cybersecurity prompts like "How to prevent SQL injection" or "anti-phishing training" from being falsely blocked.
-3. **Redaction with Placeholder Rewrite for `NEEDS_FIX` (Trade-off: User Flexibility vs. Strict Rejection)**:
-   - *Decision*: Prompts with medium severity are not outright blocked; instead, unsafe tokens are replaced with `[REDACTED]` and enhanced with missing COSTAR guidance.
-   - *Rationale*: Balances safety governance with developer ergonomics by helping users salvage acceptable intent.
+2. **Worst-Match Safety Verdict (Trade-off: Heuristic Accuracy vs. False Positives)**:
+   - *Decision*: `ISTVONBroker._analyze_safety` takes the single worst match instead of summing scores. Harmful-intent phrases (verb + target, e.g. "hack into", "write ransomware", "steal passwords", "build a bomb") block; bare topic words ("phishing", "ransomware", "personal data", "illegal") only give `NEEDS_FIX`. Defensive or test framing near a cyber match ("protect my account from…", "in Cypress tests") downgrades a cyber BLOCK to `NEEDS_FIX`; this never applies to violence, self-harm or sexual content.
+   - *Rationale*: The old summed score blocked "Summarize our bank's quarterly financial report" (two "sensitive" words) and "attack the performance bottleneck". The rules are covered by `tests/test_broker_rules.py`.
+3. **`NEEDS_FIX` Warns and Proceeds; No PII Protection (Trade-off: Output Quality vs. Redaction)**:
+   - *Decision*: On `NEEDS_FIX` the **raw prompt is sent to the LLM** (Gemini or Groq) unchanged. Only the audit-log copy (`prompt_log.sanitized_prompt`, column name kept for compatibility) has the matched spans replaced with `[REDACTED]`. The UI warns and proceeds.
+   - *Consequence*: The tool does **not** protect personal data or keep sensitive text away from the provider. Even the audit copy only redacts what a rule matched, and the raw prompt is stored right next to it (`prompt_log.original_prompt`) as well as in `istvon_transformations_log.json` and `rule_engine_logs.json`.
+   - *Rationale*: Word-level redaction destroys meaning ("Explain how [REDACTED] interest works"); genuinely harmful prompts are BLOCKed, not redacted.
 4. **Order-Preserving List Merging in `_merge_mappings`**:
    - *Design*: Merging instruction lists between rule-based and LLM outputs preserves exact original and enhanced step ordering while filtering duplicates.
 5. **Silent PostgreSQL Degradation (Trade-off: Observability vs. System Availability)**:
-   - *Decision*: All database methods in `database.py` swallow exceptions and return empty dicts or `False`.
+   - *Decision*: All database methods in `database.py` swallow exceptions and return `None` or `False`. After a failed connect, `get_connection` skips attempts for 60 s (a refused connect takes about 4 s on Windows), and the sidebar shows "Database: Not connected".
    - *Rationale*: Prevents database connection dropouts or configuration mismatches from halting the primary user-facing prompt transformation engine.
 
 ---
@@ -434,9 +442,9 @@ python -m pytest tests/ -v
 1. **Optional Online Services (Graceful Degradation)**:
    - Both Google Gemini API calls and PostgreSQL telemetry are strictly optional. When credentials are absent, invalid, or unreachable, the engine runs offline using deterministic rule-based enhancement and local JSONL logging (`rule_engine_logs.json`, `istvon_transformations_log.json`).
 2. **Untrusted Prompt Delimiters**:
-   - User prompts forwarded to Gemini for sanitizability checks or ISTVON mapping are wrapped in `<user_prompt>...</user_prompt>` boundary tags (escaping embedded closing tags) to separate untrusted input from validator instructions.
+   - User prompts forwarded to the LLM for the safety check or ISTVON mapping are wrapped in `<user_prompt>...</user_prompt>` boundary tags (escaping embedded closing tags) to separate untrusted input from validator instructions.
 3. **Runtime Log Files**:
-   - Local JSONL logs (`rule_engine_logs.json`, `istvon_transformations_log.json`) and UI export files (`exports/*.json`) are generated dynamically at runtime and excluded from version control via `.gitignore`.
+   - Local JSONL logs (`rule_engine_logs.json`, `istvon_transformations_log.json`) are written on every request, whether or not PostgreSQL is configured, and are excluded from version control via `.gitignore`. UI downloads are served by the browser; the app writes no export files.
 
 ---
 

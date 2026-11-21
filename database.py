@@ -7,6 +7,7 @@ except ImportError:
     HAS_PSYCOPG2 = False
 
 import json
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional
 from config import Config
@@ -25,6 +26,7 @@ class DatabaseManager:
         
         self.connection = None
         self._db_available = False
+        self._retry_at = 0.0  # after a failed connect, skip attempts until this time.monotonic()
         
         # Only attempt setup if psycopg2 is installed and credentials/URL are configured
         if HAS_PSYCOPG2 and (self.database_url or (self.user and self.dbname)):
@@ -36,7 +38,9 @@ class DatabaseManager:
             return None
         if not self.database_url and not (self.user and self.dbname):
             return None
-        
+        if time.monotonic() < self._retry_at:
+            return None
+
         try:
             if self.connection is None or self.connection.closed:
                 if self.database_url:
@@ -52,6 +56,8 @@ class DatabaseManager:
                 self._db_available = True
             return self.connection
         except Exception as e:
+            # A refused connect can take seconds (Windows retries); don't pay that on every request.
+            self._retry_at = time.monotonic() + 60
             if not hasattr(self, '_connection_warned'):
                 print(f"PostgreSQL connection info: {e}")
                 self._connection_warned = True
@@ -88,7 +94,7 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_prompt_log_verdict ON prompt_log (verdict);
                 ''')
                 conn.commit()
-                print("✅ PostgreSQL prompt_log table & indexes verified successfully")
+                print("[OK] PostgreSQL prompt_log table & indexes verified successfully")
         except Exception as e:
             print(f"Error setting up PostgreSQL database: {e}")
             if conn:
@@ -98,11 +104,11 @@ class DatabaseManager:
                           success: bool, domain: str = "auto", 
                           processing_time: int = 0, verdict: str = None,
                           reason: str = None, sanitized_prompt: str = None,
-                          response: str = None) -> bool:
-        """Log prompt transformation telemetry into PostgreSQL prompt_log table"""
+                          response: str = None) -> Optional[int]:
+        """Insert one prompt_log row; returns its id, or None if the database is unavailable."""
         conn = self.get_connection()
         if not conn:
-            return False
+            return None
         
         try:
             if verdict is None:
@@ -113,6 +119,7 @@ class DatabaseManager:
                     INSERT INTO prompt_log 
                     (timestamp, original_prompt, verdict, reason, sanitized_prompt, final_response, istvon_map_json)
                     VALUES (CURRENT_TIMESTAMP, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                 ''', (
                     original_prompt,
                     verdict,
@@ -121,172 +128,26 @@ class DatabaseManager:
                     response,
                     json.dumps(istvon_json)
                 ))
+                row_id = cursor.fetchone()[0]
                 conn.commit()
-                return True
+                return row_id
         except Exception as e:
             print(f"Error logging transformation to PostgreSQL: {e}")
             if conn:
                 conn.rollback()
-            return False
-    
-    def get_analytics(self) -> Dict[str, Any]:
-        """Get transformation analytics from PostgreSQL"""
-        conn = self.get_connection()
-        if not conn:
-            return {"total_transformations": 0, "avg_prompt_length": 0, "success_rate": 0}
-        
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute('''
-                    SELECT 
-                        COUNT(*) as total,
-                        COALESCE(AVG(LENGTH(original_prompt)), 0) as avg_length,
-                        COALESCE(COUNT(CASE WHEN verdict = 'ALLOW' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 0) as success_rate
-                    FROM prompt_log
-                ''')
-                result = cursor.fetchone()
-                
-                return {
-                    "total_transformations": result[0] or 0,
-                    "avg_prompt_length": round(float(result[1] or 0), 1),
-                    "success_rate": round(float(result[2] or 0), 1)
-                }
-        except Exception as e:
-            print(f"Error getting analytics: {e}")
-            return {"total_transformations": 0, "avg_prompt_length": 0, "success_rate": 0}
-    
-    def get_recent_transformations(self, limit: int = 5) -> list:
-        """Get recent transformations for UI display"""
-        conn = self.get_connection()
-        if not conn:
-            return []
-        
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute('''
-                    SELECT original_prompt, istvon_map_json, timestamp, verdict
-                    FROM prompt_log 
-                    ORDER BY timestamp DESC 
-                    LIMIT %s
-                ''', (limit,))
-                results = cursor.fetchall()
-                
-                return [
-                    {
-                        "prompt": str(row[0])[:100] + "..." if len(str(row[0])) > 100 else str(row[0]),
-                        "timestamp": row[2].strftime("%Y-%m-%d %H:%M:%S") if hasattr(row[2], 'strftime') else str(row[2]),
-                        "success": row[3] == "ALLOW"
-                    }
-                    for row in results
-                ]
-        except Exception as e:
-            print(f"Error getting recent transformations: {e}")
-            return []
-    
-    def get_sanitized_prompts(self, limit: int = 10) -> list:
-        """Get recent sanitized prompts for UI display"""
-        conn = self.get_connection()
-        if not conn:
-            return []
-        
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute('''
-                    SELECT original_prompt, istvon_map_json, sanitized_prompt, timestamp, verdict
-                    FROM prompt_log 
-                    WHERE sanitized_prompt IS NOT NULL AND sanitized_prompt != ''
-                    ORDER BY timestamp DESC 
-                    LIMIT %s
-                ''', (limit,))
-                results = cursor.fetchall()
-                
-                return [
-                    {
-                        "original_prompt": str(row[0]),
-                        "istvon_json": row[1] if isinstance(row[1], dict) else json.loads(str(row[1])) if row[1] else {},
-                        "sanitized_prompt": str(row[2]) if row[2] else "",
-                        "timestamp": row[3].strftime("%Y-%m-%d %H:%M:%S") if hasattr(row[3], 'strftime') else str(row[3]),
-                        "verdict": row[4]
-                    }
-                    for row in results
-                ]
-        except Exception as e:
-            print(f"Error getting sanitized prompts: {e}")
-            return []
-    
-    def import_from_json_file(self, json_filepath: str) -> bool:
-        """Import response data from a JSON file and store in PostgreSQL database"""
-        try:
-            with open(json_filepath, 'r', encoding='utf-8') as f:
-                response_data = json.load(f)
-            
-            if 'original_prompt' in response_data:
-                original_prompt = response_data.get('original_prompt', '')
-                verdict = response_data.get('verdict', 'ALLOW')
-                reason = response_data.get('reason', 'Imported from JSON')
-                sanitized_prompt = response_data.get('sanitized_prompt')
-                final_response = response_data.get('final_response', '')
-                istvon_data = response_data.get('istvon_map_json', {})
-                metadata = response_data.get('metadata', {})
-                processing_time = metadata.get('processing_time_ms', 0)
-            else:
-                metadata = response_data.get('metadata', {})
-                input_data = response_data.get('input', {})
-                istvon_data = response_data.get('istvon_framework', {})
-                generated_response = response_data.get('generated_response', '')
-                
-                original_prompt = input_data.get('original_prompt', '')
-                verdict = metadata.get('verdict', 'ALLOW')
-                reason = metadata.get('reason', 'Imported from JSON')
-                sanitized_prompt = input_data.get('sanitized_prompt')
-                final_response = generated_response
-                processing_time = metadata.get('processing_time_ms', 0)
-            
-            return self.log_transformation(
-                original_prompt=original_prompt,
-                istvon_json=istvon_data,
-                success=verdict == 'ALLOW',
-                domain='auto',
-                processing_time=processing_time,
-                verdict=verdict,
-                reason=reason,
-                sanitized_prompt=sanitized_prompt,
-                response=final_response
-            )
-        except Exception as e:
-            print(f"Error importing from JSON file: {str(e)}")
-            return False
-    
-    def get_response_by_timestamp(self, timestamp: str) -> Optional[Dict[str, Any]]:
-        """Get response data by timestamp"""
-        conn = self.get_connection()
-        if not conn:
             return None
-        
+
+    def log_response(self, row_id: int, response: str) -> bool:
+        """Store the generated LLM response on an existing prompt_log row."""
+        conn = self.get_connection()
+        if not conn or not row_id:
+            return False
         try:
             with conn.cursor() as cursor:
-                cursor.execute('''
-                    SELECT id, timestamp, original_prompt, verdict, reason, 
-                           sanitized_prompt, final_response, istvon_map_json
-                    FROM prompt_log 
-                    WHERE TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') LIKE %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                ''', (f"%{timestamp}%",))
-                result = cursor.fetchone()
-                
-                if result:
-                    return {
-                        "id": result[0],
-                        "timestamp": result[1].strftime("%Y-%m-%d %H:%M:%S") if hasattr(result[1], 'strftime') else str(result[1]),
-                        "original_prompt": str(result[2]),
-                        "verdict": result[3],
-                        "reason": str(result[4]) if result[4] else "",
-                        "sanitized_prompt": str(result[5]) if result[5] else "",
-                        "final_response": str(result[6]) if result[6] else "",
-                        "istvon_map_json": result[7] if isinstance(result[7], dict) else json.loads(str(result[7])) if result[7] else {}
-                    }
-                return None
+                cursor.execute("UPDATE prompt_log SET final_response = %s WHERE id = %s", (response, row_id))
+            conn.commit()
+            return True
         except Exception as e:
-            print(f"Error getting response by timestamp: {e}")
-            return None
+            print(f"Error storing response in PostgreSQL: {e}")
+            conn.rollback()
+            return False
