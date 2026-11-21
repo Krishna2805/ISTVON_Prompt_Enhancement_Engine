@@ -1,7 +1,7 @@
 # Architecture: ISTVON Prompt Enhancement Engine
 
 ## 1. Purpose & Scope
-The **ISTVON Prompt Enhancement Engine** is a dual-tier prompt engineering, governance, and transformation system designed for developers, enterprise AI operators, and end-users who need to convert ambiguous, unstructured natural language prompts into deterministic, machine-readable, and guardrailed prompt specifications. It solves the unpredictability, prompt injection vulnerabilities, and incomplete context of raw LLM prompts by enforcing the **ISTVON** structural framework (**I**nstructions, **S**ources, **T**ools, **V**ariables, **O**utcome, **N**otifications) paired with **COSTAR** gap analysis, two-stage safety brokerage (RegEx heuristic filtering + an LLM safety check), and a basic offline fallback. It does **not** protect personal data: prompts are sent to the configured LLM provider as typed (see Design Decision 3).
+The **ISTVON Prompt Enhancement Engine** is a dual-tier prompt engineering, governance, and transformation system designed for developers, enterprise AI operators, and end-users who need to convert ambiguous, unstructured natural language prompts into deterministic, machine-readable, and guardrailed prompt specifications. It reduces the unpredictability and incomplete context of raw LLM prompts (and fences user text against prompt injection, which lowers but does not remove that risk) by enforcing the **ISTVON** structural framework (**I**nstructions, **S**ources, **T**ools, **V**ariables, **O**utcome, **N**otifications) paired with **COSTAR** gap analysis, two-stage safety brokerage (RegEx heuristic filtering + an LLM safety check), and a basic offline fallback. It does **not** protect personal data: prompts are sent to the configured LLM provider as typed (see Design Decision 3).
 
 ---
 
@@ -86,6 +86,8 @@ flowchart TD
 ISTVON_Prompt_Enhancement_Engine/
 ├── .env.example
 ├── .gitignore
+├── .streamlit/
+│   └── config.toml
 ├── README.md
 ├── app.py
 ├── config.py
@@ -147,7 +149,7 @@ ISTVON_Prompt_Enhancement_Engine/
 - **Key Functions/Classes**:
   - `ISTVONEngine`: Main pipeline orchestrator.
   - `ISTVONEngine.process_prompt(prompt)`: Executes the 9-step prompt transformation pipeline.
-  - `ISTVONEngine.generate_response_with_istvon(original_prompt, istvon_data)`: Re-prompts Gemini using the complete ISTVON specification as a structured system constraint.
+  - `ISTVONEngine.generate_response_with_istvon(original_prompt, istvon_data)`: Re-prompts the configured LLM (Gemini or Groq) using the complete ISTVON specification as a structured system constraint.
   - `log_istvon_transformation(...)`: Writes end-to-end execution logs to `istvon_transformations_log.json`.
   - `main()`: Streamlit reactive UI lifecycle controller.
 - **Non-Obvious Details**:
@@ -172,7 +174,7 @@ ISTVON_Prompt_Enhancement_Engine/
 - **Why it's critical**: Manages all LLM calls (Gemini via `google-genai`, Groq via stdlib HTTP), including structural prompt generation, LLM response extraction, dictionary merging, and the LLM safety check.
 - **Key Functions/Classes**:
   - `LLMISTVONMapper.__init__(api_key=_UNSET, model_name=_UNSET, provider=_UNSET)`: With no arguments, uses `Config.llm_settings()` (Gemini, then Groq, or `LLM_PROVIDER`). Initializes `google.genai.Client` (millisecond `types.HttpOptions`) or `GroqClient`. The `_UNSET` sentinel distinguishes unpassed arguments from explicit `None` (which forces offline mode in tests).
-  - `LLMISTVONMapper.enhance_mapping(natural_prompt, preliminary_map, context)`: Sends structured instructions to Gemini to complete missing ISTVON elements, falling back to rule-based mapping on any failure.
+  - `LLMISTVONMapper.enhance_mapping(natural_prompt, preliminary_map, context)`: Sends structured instructions to the LLM (JSON mode) to complete missing ISTVON elements, falling back to rule-based mapping on any failure.
   - `LLMISTVONMapper._merge_mappings(rule_based, llm_enhanced)`: Intelligently merges rule-based dictionary keys and LLM-generated dictionary keys while preserving insertion order.
   - `LLMISTVONMapper.check_prompt_safety(prompt)`: Asks the LLM for `{"safe": bool, "reason": str}` to identify social engineering, phishing, credential harvesting, or guardrail bypass attempts hidden behind benign framing (e.g., "for educational research").
 - **Non-Obvious Details**:
@@ -276,8 +278,8 @@ ISTVON_Prompt_Enhancement_Engine/
     │    - PRIMARY USER REQUEST: "Write a python script to parse CSV files and calculate mean values"
     │    - SUPPORTING ISTVON FRAMEWORK: Formatted Instructions, Sources, Tools, Variables, Expected Outcome
     │
-    ├──> [Step 4.2] Calls Gemini API:
-    │    └── self.llm_mapper.generate_response(full_prompt, ...) -> client.models.generate_content() -> Returns completed markdown response
+    ├──> [Step 4.2] Calls the LLM:
+    │    └── self.llm_mapper.generate_response(full_prompt) -> Gemini generate_content() or Groq chat completion -> Returns completed markdown response
     │
     ├──> [Step 4.3] Audit Logging Update:
     │    └── Appends combined payload (original prompt + ISTVON spec + final LLM code) to istvon_transformations_log.json
@@ -312,8 +314,8 @@ Configuration is managed via `config.py`, which loads `.env` next to `config.py`
 | `DEFAULT_TIMEOUT` | *(Static)* | `30` | Default network request timeout in seconds (passed as `Config.DEFAULT_TIMEOUT * 1000` ms to `google-genai` `HttpOptions`). |
 
 ### Placeholder Detection Logic
-`Config.is_valid_api_key()` automatically checks against known dummy strings:
-`['your-', 'api-key-here', 'placeholder', 'xxx', '<', '>', 'invalid', 'test-key', 'dummy', 'fake', 'sample-key']`.
+`Config.is_valid_api_key()` and `Config.is_valid_model_name()` (used for both Gemini and Groq values) reject values containing known dummy strings, after lowercasing and turning `_` into `-`:
+`['your-', 'api-key-here', 'model-here', 'placeholder', 'xxx', '<', '>', 'invalid', 'test-key', 'dummy', 'fake', 'sample-key']`.
 
 ---
 
@@ -440,10 +442,12 @@ python -m pytest tests/ -v
 ## 11. Operational Notes & Runtime Characteristics
 
 1. **Optional Online Services (Graceful Degradation)**:
-   - Both Google Gemini API calls and PostgreSQL telemetry are strictly optional. When credentials are absent, invalid, or unreachable, the engine runs offline using deterministic rule-based enhancement and local JSONL logging (`rule_engine_logs.json`, `istvon_transformations_log.json`).
+   - LLM calls (Gemini or Groq) and PostgreSQL logging are strictly optional. When credentials are absent, invalid, or unreachable, the engine runs offline using deterministic rule-based enhancement and local JSONL logging (`rule_engine_logs.json`, `istvon_transformations_log.json`).
 2. **Untrusted Prompt Delimiters**:
-   - User prompts forwarded to the LLM for the safety check or ISTVON mapping are wrapped in `<user_prompt>...</user_prompt>` boundary tags (escaping embedded closing tags) to separate untrusted input from validator instructions.
-3. **Runtime Log Files**:
+   - User prompts forwarded to the LLM for the safety check or ISTVON mapping are wrapped in `<user_prompt>...</user_prompt>` boundary tags to separate untrusted input from validator instructions. Any spelling of an embedded closing tag (`</USER_PROMPT>`, `</ user_prompt >`) is escaped. This lowers prompt-injection risk but does not remove it.
+3. **Network exposure**:
+   - `.streamlit/config.toml` binds the server to `localhost` and turns off usage statistics. There is no login, rate limit or token cap, and Streamlit 1.28.0 has published advisories that need network access (CVE-2024-42474, CVE-2026-33682, GHSA-8qw9-gf7w-42x5; fixed in 1.30–1.54), so the app is meant to stay local.
+4. **Runtime Log Files**:
    - Local JSONL logs (`rule_engine_logs.json`, `istvon_transformations_log.json`) are written on every request, whether or not PostgreSQL is configured, and are excluded from version control via `.gitignore`. UI downloads are served by the browser; the app writes no export files.
 
 ---

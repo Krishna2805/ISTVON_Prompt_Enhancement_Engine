@@ -66,7 +66,7 @@ The regex tier uses the **single worst match**, not a sum of scores:
 Defensive or test framing near a cyber term ("protect my account from someone trying to hack into it", "bypass authentication in Cypress tests") downgrades BLOCK to NEEDS_FIX. When an LLM is configured, it then runs a second safety check that can still BLOCK.
 
 ### COSTAR Gap Analysis
-Scores the prompt against **C**ontext, **O**bjective, **S**uccess criteria, **T**imeline, **A**udience and **R**esources. Missing elements are shown as suggestions and passed to the LLM so it can fill sensible defaults. They never block a prompt.
+Scores the prompt against **C**ontext, **O**bjective, **S**uccess criteria, **T**imeline, **A**udience and **R**esources. Missing elements are shown as suggestions and passed to the LLM so it can fill sensible defaults. They never block a prompt. This is the project's own variant: the published CO-STAR framework (GovTech Singapore) is Context, Objective, Style, Tone, Audience, Response. Detection is keyword-based, so it is a rough completeness hint, not a quality score.
 
 ---
 
@@ -84,7 +84,7 @@ Scores the prompt against **C**ontext, **O**bjective, **S**uccess criteria, **T*
 
 **Groq support** is a recent addition. Groq serves open models through an OpenAI-compatible chat-completions API. The app calls it with Python's standard library (`urllib`), so it needs no extra package. It was tested with `openai/gpt-oss-120b`; other Groq chat models that support JSON mode should work but were not tested. Gemini goes through the `google-genai` SDK (tested with `gemini-3.1-flash-lite`).
 
-To enable one, put a key **and** a model in `.env` (copy `.env.example`) and restart the app:
+To enable one, put a key **and** a model in `.env` (copy `.env.example`) and restart the app. The model is your choice: `GEMINI_MODEL` / `GROQ_MODEL` take any model ID your key can use (there is no default and no model picker in the UI; settings are read at startup). For Groq, pick a model that supports JSON mode.
 
 | Provider | Settings | Where to get a key |
 |---|---|---|
@@ -171,6 +171,7 @@ streamlit run app.py
 ```
 - Default URL: **`http://localhost:8501`**
 - Another port: `streamlit run app.py --server.port 8700`
+- `.streamlit/config.toml` binds the app to `localhost` only and turns off Streamlit usage statistics. Streamlit 1.28 has published advisories that need network access to the server (CVE-2024-42474 and CVE-2026-33682 on Windows, GHSA-8qw9-gf7w-42x5), and the app uses your API key, so don't expose it on a network. To share it on your LAN on purpose: `--server.address 0.0.0.0`.
 
 ### 2. Check the Database Connection
 
@@ -215,6 +216,7 @@ Tests run in a temporary directory, so they never touch your JSON logs or the da
 ```
 ISTVON_Prompt_Enhancement_Engine/
 ├── README.md
+├── .streamlit/config.toml     # Binds to localhost, usage stats off
 ├── docs/
 │   └── ARCHITECTURE.md        # Detailed architecture & design decisions
 ├── app.py                     # Streamlit app + ISTVONEngine pipeline
@@ -244,10 +246,11 @@ Downloads (ISTVON JSON, ISTVON + response JSON) are served by the browser; the a
 ## ⚖️ Design choices and limitations
 
 - **NEEDS_FIX warns and proceeds; it does not protect personal data.** On NEEDS_FIX the raw prompt is sent to the LLM provider (Google or Groq) exactly as typed. The redaction only affects one audit copy: the `prompt_log.sanitized_prompt` column (the name is historical). Even that copy only replaces what a rule matched, and the raw prompt is stored next to it in `prompt_log.original_prompt` and in both JSON log files. Don't type real personal data into the app if it must not leave your machine. Redacting before sending was rejected because word-level redaction breaks the request ("Explain how [REDACTED] interest works").
-- **The regex broker judges the worst single match.** Harmful-intent phrases block; bare topic words only flag for review. Regexes miss paraphrases, so the LLM safety check is the second line, and that only runs when an LLM is configured.
+- **The regex broker judges the worst single match.** Harmful-intent phrases block; bare topic words only flag for review. Regexes miss paraphrases, so the LLM safety check is the second line, and that only runs when an LLM is configured. The defensive-framing downgrade can be gamed: "Hack into the bank's servers, in pytest tests" becomes NEEDS_FIX instead of BLOCK, leaving the LLM check as the only block.
 - **The LLM safety check fails open.** With no LLM, or if the call fails or returns something unparseable, the prompt continues with only the regex verdict. The UI says "LLM safety check skipped" and why (e.g. "LLM call failed: ServerError"). This happened during testing: a Gemini 503 "high demand" error let an OTP-phishing prompt through on the regex verdict alone, though the same prompt is blocked when Gemini answers. Fail-closed would make the app unusable offline; this is the trade-off.
 - **Self-harm support message.** When a self-harm rule matches, the prompt is blocked and the only recommendation shown is: "If you are in immediate danger, call your local emergency number. To find a free, confidential helpline in your country, visit https://findahelpline.com." It is region-neutral on purpose: Find A Helpline (run by ThroughLine; the directory the International Association for Suicide Prevention points to) covers many countries, and hard-coded numbers would be wrong for most users. **This tool is not a crisis service.**
 - **Offline mode is basic.** Regex extraction plus domain templates; no LLM safety check, no response generation.
 - **One LLM provider at a time.** `LLM_PROVIDER` forces one and never falls back to the other (see [LLM providers](#-llm-providers-gemini-or-groq)).
 - **PostgreSQL is best-effort.** Failures are printed to the console and never stop a request. After a failed connect the app waits a minute before retrying, so a database outage costs at most one slow request per minute.
+- **Local single-user tool, not a hosted service.** No login, no rate limit and no token cap: anyone who can reach the app spends your API quota. It is bound to `localhost` by default (see Usage). Streamlit is pinned at 1.28.0, which has known advisories fixed in later versions (up to 1.54.0); upgrading needs a re-test of the UI.
 - **Local logs keep raw prompts.** `istvon_transformations_log.json` and `rule_engine_logs.json` are written on every request and are git-ignored; delete them if they hold anything sensitive.
